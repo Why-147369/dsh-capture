@@ -1,0 +1,4 @@
+{
+  "title": "Capture / 抓包与流量分析",
+  "description": "Windows pktmon 实时抓包、pcapng 解析、HTTP/DNS/TCP 会话提取与 agent 分析工具。"
+}

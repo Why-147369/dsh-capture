@@ -1,0 +1,5 @@
+# dsh-capture bundle layer: applied automatically when the package is
+# installed as a profile bundle (package.json declares dsh.bundle.patch).
+- insert:
+    - id: dsh-capture
+      name: dsh-capture

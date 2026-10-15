@@ -1,0 +1,16 @@
+# 安装/同步产生的备份与日志
+backup-dsh-capture-*/
+install-dsh-capture.log
+sync.log
+verify-installed.log
+
+# 依赖与产物
+node_modules/
+*.tgz
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

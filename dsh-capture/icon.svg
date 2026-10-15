@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="Capture">
+  <!--
+    Capture / packet-capture icon: a framing brace pair (the capture window)
+    enclosing a diagonal stream of packets. Matches the plugin's job — watching
+    packets flow past — instead of a generic settings glyph.
+
+    Colors are literal because an icon is artwork; the two blues keep the mark
+    legible on both light and dark host themes without relying on tokens.
+  -->
+  <g fill="none" stroke="#3B82F6" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Left capture brace -->
+    <path d="M6.5 3.5H4.5a1.5 1.5 0 0 0-1.5 1.5v14a1.5 1.5 0 0 0 1.5 1.5h2"/>
+    <!-- Right capture brace -->
+    <path d="M17.5 3.5h2a1.5 1.5 0 0 1 1.5 1.5v14a1.5 1.5 0 0 1-1.5 1.5h-2"/>
+    <!-- Diagonal packet stream -->
+    <rect x="8.6" y="6.6" width="3" height="3" rx="0.7" fill="#3B82F6" stroke="none"/>
+    <rect x="11.4" y="10.5" width="3" height="3" rx="0.7" fill="#60A5FA" stroke="none"/>
+    <rect x="9.2" y="14.4" width="3" height="3" rx="0.7" fill="#93C5FD" stroke="none"/>
+  </g>
+</svg>
