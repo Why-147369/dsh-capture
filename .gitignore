@@ -14,3 +14,8 @@ node_modules/
 *.swp
 .DS_Store
 Thumbs.db
+
+# 提交信息临时文件
+commit-msg.txt
+*.pending
+
