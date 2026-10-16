@@ -47,7 +47,8 @@
   - TLS SNI 与握手参数
   - 明文 HTTP/1.x 请求行与响应状态
   - Top 会话、Top 端口、端点数
-- **时间戳**：包行与摘要都带 ISO-8601 UTC 时间
+- **时间戳**：包行与摘要都带 ISO-8601 UTC 时间（按文件声明的 `if_tsresol` 换算）
+- **大文件流式解析**：超过 16 MB 的抓包分块读取，峰值内存不随文件大小增长（上限 2 GB）
 - **包级浏览**：分页读取单个数据包，支持协议 / 端口 / 主机 / 关键词过滤
 - **结构化导出**：CSV（带 BOM，Excel 直接可读）与 JSON 摘要（含流与 HTTP 事务）
 - **6 个 agent 工具**：让模型自己抓包并读懂流量
@@ -70,10 +71,13 @@
 - 解析器回归测试：带 options 的真实形状 IDB、linkType=0 容错、多包完整解析
 - **TCP 重组回归测试（7 组）**：跨包 HTTP 请求/响应完整读出、乱序片段按 seq 排序、
   缺口检出、ClientHello 版本与套件、ServerHello 协商结果、ISO 时间、上限约束与开关
+- **流式解析测试（9 组）**：pcapng/pcap 流式结果与整读逐字段一致、4KB chunk 跨边界、
+  `maxPackets`、截断文件、非法输入、流式下的重组、**路由接线**（18.3 MB 文件经
+  `/analyze` 与 `/packets` 走流式）
 - 方法校验（`GET /start` → 405）、无效 id → 404、路径穿越 id → 404
 - 包级浏览分页与协议/端口过滤、CSV/JSON 导出、正则检索（无效正则返 400）
 - Client bundle 契约、slot 注册（`settings.section`）、图标与 manifest 契约
-- 装机验证共 **38 项**、解析器/重组单元测试 **3 组全过**、端到端 **9 项**
+- 装机验证共 **48 项**、单元/契约测试 **5 组全过**、端到端 **9 项**
 
 ### 未验证 / 已知问题 ⚠️
 
@@ -84,7 +88,8 @@
   要解密需要 SSLKEYLOGFILE 或私钥 —— 尚未支持
 - **HTTP/2 与 HTTP/3 未解析**：只识别 HTTP/1.x 文本协议
 - **chunked 响应体未拼接**：`Transfer-Encoding: chunked` 只记录头部，不还原分块体
-- 大文件未做流式解析（整文件读入，默认上限 96 MB）
+- **流式解析的包数组仍随包数增长**：受 `maxAnalyzePackets` 约束，不是无上限；
+  真正需要任意大时可先按 BPF 裁剪抓包
 - 抓包文件无自动清理策略（Npcap 后端支持 `ringFileMb` 回绕，但旧文件需手动删）
 - 设置页 UI 的深浅主题适配仅按 token 规则编写，未在真实页面逐项核对
 - 仅 Windows；macOS / Linux 未支持
@@ -213,12 +218,13 @@ node repoint-dsh-capture.mjs              # 备份 + 改依赖 + pnpm install + 
 node sync-dsh-capture.mjs
 
 # 验证
-node verify-installed.mjs              # 装机回归 45 项（后端/网卡/BPF/路由/重组/工具/类型）
+node verify-installed.mjs              # 装机回归 48 项（后端/网卡/BPF/路由/重组/流式/工具/类型）
 node verify-icon.cjs                   # 图标与 manifest
 node recheck-22.mjs                    # 完成度清单复核（22 项）
 node dsh-capture/test/selftest.mjs               # 解析器基础自测
 node dsh-capture/test/pcapng-idb.test.mjs        # pcapng IDB 偏移 + if_tsresol 回归
 node dsh-capture/test/stream-reassembly.test.mjs # TCP 重组 / HTTP 体 / TLS 详情（7 组）
+node dsh-capture/test/streaming.test.mjs         # 流式解析 + 路由接线（9 组）
 node dsh-capture/test/routes.test.mjs            # 路由契约（23 项，CI 可裸跑）
 ```
 
@@ -237,7 +243,7 @@ dsh-capture/
 ├── lib/
 │   ├── index.js         # 入口：挂路由 + 注册 agent 工具 + Config
 │   ├── routes.js        # 13 条 HTTP 路由
-│   ├── pcap.js          # pcapng/pcap 解析器 + TCP 重组 + HTTP/TLS 提取（零依赖）
+│   ├── pcap.js          # pcapng/pcap 解析器 + 流式解析 + TCP 重组 + HTTP/TLS 提取（零依赖）
 │   ├── npcap.js         # Npcap/dumpcap 后端（首选，免提权）
 │   ├── pktmon.js        # pktmon 驱动封装（后备）
 │   ├── perm.js          # 后端选择与环境报告
@@ -249,6 +255,7 @@ dsh-capture/
     ├── selftest.mjs               # 解析器基础自测
     ├── pcapng-idb.test.mjs        # IDB 偏移 + if_tsresol 回归
     ├── stream-reassembly.test.mjs # TCP 重组 / HTTP 体 / TLS 详情（7 组）
+    ├── streaming.test.mjs         # 流式解析 + 路由接线（9 组）
     └── routes.test.mjs            # 路由契约（23 项，无需已安装 profile）
 ```
 

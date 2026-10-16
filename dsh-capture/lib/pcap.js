@@ -572,12 +572,12 @@ export function parseCapture(buf, opts = {}) {
  * Classic libpcap format.
  * @param {Buffer} buf
  * @param {number} maxPackets
+ * @param {object} [opts]
  * @returns {object}
  */
 function parsePcapClassic(buf, maxPackets, opts = {}) {
   const le = buf.readUInt32LE(0) === PCAP_MAGIC_LE;
   const readU32 = (o) => (le ? buf.readUInt32LE(o) : buf.readUInt32BE(o));
-  const readU16 = (o) => (le ? buf.readUInt16LE(o) : buf.readUInt16BE(o));
   const linkType = readU32(20);
   let off = 24;
   const packets = [];
@@ -586,7 +586,6 @@ function parsePcapClassic(buf, maxPackets, opts = {}) {
   while (off + 16 <= buf.length && packets.length < maxPackets) {
     const tsSec = readU32(off);
     const inclLen = readU32(off + 8);
-    const origLen = readU32(off + 12);
     off += 16;
     if (inclLen > buf.length - off) { stats.truncated++; break; }
     const data = buf.subarray(off, off + inclLen);
@@ -594,120 +593,317 @@ function parsePcapClassic(buf, maxPackets, opts = {}) {
     if (pkt) packets.push(pkt);
     off += inclLen;
   }
-  return assemble(packets, stats, { format: 'pcap', linkType, truncatedOrig: 0 }, opts);
+  // Classic pcap stores timestamps in microseconds.
+  return assemble(packets, stats, {
+    format: 'pcap', linkType, truncatedOrig: 0, tsResolution: 1e6,
+  }, opts);
+}
+
+/* ------------------------------------------------------------------ *
+ * Streaming parse (bounded memory on large captures)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Read a capture file in chunks instead of loading it whole.
+ *
+ * Peak memory is bounded by the chunk size plus at most one block, rather than
+ * by file size. The packet list still grows, but that is capped by
+ * `maxPackets` and by the reassembly budgets.
+ */
+class ChunkReader {
+  /**
+   * @param {import('node:fs/promises').FileHandle} fh
+   * @param {number} chunkBytes
+   */
+  constructor(fh, chunkBytes) {
+    this.fh = fh;
+    this.chunkBytes = chunkBytes;
+    this.pos = 0;
+    this.carry = Buffer.alloc(0);
+    this.eof = false;
+    this.bytesReadTotal = 0;
+  }
+
+  /** Grow the carry buffer until it holds at least `minBytes` (or EOF). */
+  async fill(minBytes) {
+    while (this.carry.length < minBytes && !this.eof) {
+      // Read enough to satisfy the request in one go when a block is large.
+      const want = Math.max(this.chunkBytes, minBytes - this.carry.length);
+      const buf = Buffer.allocUnsafe(want);
+      const { bytesRead } = await this.fh.read(buf, 0, want, this.pos);
+      if (bytesRead === 0) { this.eof = true; break; }
+      this.pos += bytesRead;
+      this.bytesReadTotal += bytesRead;
+      const piece = buf.subarray(0, bytesRead);
+      this.carry = this.carry.length ? Buffer.concat([this.carry, piece]) : piece;
+    }
+    return this.carry;
+  }
+
+  /** Drop `n` bytes from the front of the carry buffer. */
+  drop(n) {
+    this.carry = n >= this.carry.length ? Buffer.alloc(0) : this.carry.subarray(n);
+  }
+}
+
+/** pcap global header size. */
+const PCAP_HEADER_BYTES = 24;
+/** pcap per-record header size. */
+const PCAP_RECORD_HEADER_BYTES = 16;
+
+/**
+ * Parse a capture file from disk without holding the whole file in memory.
+ *
+ * Supports both pcapng and classic pcap, and produces the same shape as
+ * `parseCapture` — the difference is peak memory, not output.
+ *
+ * @param {string} filePath
+ * @param {{maxPackets?:number, chunkBytes?:number, reassemble?:boolean,
+ *          streamCap?:number, maxStreams?:number, bodyCap?:number}} [opts]
+ * @returns {Promise<object>}
+ */
+export async function parseCaptureStream(filePath, opts = {}) {
+  const { open } = await import('node:fs/promises');
+  const maxPackets = Number.isFinite(opts.maxPackets) ? opts.maxPackets : 200000;
+  const chunkBytes = Number.isFinite(opts.chunkBytes) && opts.chunkBytes >= 4096
+    ? Math.floor(opts.chunkBytes)
+    : 4 * 1024 * 1024;
+
+  const fh = await open(filePath, 'r');
+  const reader = new ChunkReader(fh, chunkBytes);
+  try {
+    const head = Buffer.alloc(PCAP_HEADER_BYTES);
+    const { bytesRead } = await fh.read(head, 0, PCAP_HEADER_BYTES, 0);
+    if (bytesRead < 4) throw new Error('文件太小，不是有效的抓包文件（需至少 4 字节）');
+
+    const first = head.readUInt32LE(0);
+    const isPcapng = first === PCAPNG_SHB || head.readUInt32BE(0) === PCAPNG_SHB;
+    const isPcap = first === PCAP_MAGIC_LE || first === PCAP_MAGIC_BE;
+    if (!isPcapng && !isPcap) throw new Error('无法识别的抓包格式（既不是 pcap 也不是 pcapng）');
+
+    const packets = [];
+    const state = createParseState();
+    const format = isPcapng ? 'pcapng' : 'pcap';
+    let linkType = null;
+    let tsResolution = 1e6;
+    let sawTailProblem = false;
+
+    if (isPcapng) {
+      for (;;) {
+        const buf = await reader.fill(12);
+        if (buf.length < 12) break;
+        const totalLen = pcapngBlockLength(buf, 0, buf.length);
+        if (totalLen <= 0) { state.stats.truncated++; sawTailProblem = true; break; }
+        const full = await reader.fill(totalLen);
+        if (full.length < totalLen) { state.stats.truncated++; sawTailProblem = true; break; }
+        consumePcapngBlock(full, 0, totalLen, state, packets, maxPackets);
+        reader.drop(totalLen);
+        if (packets.length >= maxPackets) { sawTailProblem = true; break; }
+      }
+      linkType = state.linkTypes[state.linkTypes.length - 1] ?? null;
+      tsResolution = state.tsResolutions[state.tsResolutions.length - 1] ?? 1e6;
+    } else {
+      const le = head.readUInt32LE(0) === PCAP_MAGIC_LE;
+      const read32 = (b, o) => (le ? b.readUInt32LE(o) : b.readUInt32BE(o));
+      const first24 = await reader.fill(PCAP_HEADER_BYTES);
+      if (first24.length < PCAP_HEADER_BYTES) throw new Error('pcap 全局头不完整');
+      linkType = read32(first24, 20);
+      reader.drop(PCAP_HEADER_BYTES);
+      for (;;) {
+        const buf = await reader.fill(PCAP_RECORD_HEADER_BYTES);
+        if (buf.length < PCAP_RECORD_HEADER_BYTES) break;
+        const tsSec = read32(buf, 0);
+        const inclLen = read32(buf, 8);
+        if (!Number.isFinite(inclLen) || inclLen > 64 * 1024 * 1024) {
+          state.stats.truncated++; sawTailProblem = true; break;
+        }
+        const full = await reader.fill(PCAP_RECORD_HEADER_BYTES + inclLen);
+        if (full.length < PCAP_RECORD_HEADER_BYTES + inclLen) {
+          state.stats.truncated++; sawTailProblem = true; break;
+        }
+        const data = full.subarray(PCAP_RECORD_HEADER_BYTES, PCAP_RECORD_HEADER_BYTES + inclLen);
+        const pkt = decodeByLinkType(data, linkType, tsSec, state.stats);
+        if (pkt && packets.length < maxPackets) packets.push(pkt);
+        reader.drop(PCAP_RECORD_HEADER_BYTES + inclLen);
+        if (packets.length >= maxPackets) { sawTailProblem = true; break; }
+      }
+      // Classic pcap has no blocks; drop the counter so the shape matches the
+      // in-memory path exactly.
+      delete state.stats.blocks;
+    }
+
+    const result = assemble(packets, state.stats, {
+      format,
+      linkType,
+      version: state.sectionVersion,
+      tsResolution,
+      truncatedOrig: sawTailProblem ? 1 : 0,
+    }, opts);
+    result.meta.streamed = true;
+    result.meta.chunkBytes = chunkBytes;
+    result.meta.bytesRead = reader.bytesReadTotal;
+    // Payload views are only needed for reassembly; dropping them releases the
+    // underlying chunks so peak memory does not track the whole file.
+    for (const p of result.packets) {
+      if (Object.prototype.hasOwnProperty.call(p, 'payloadBuf')) {
+        try { delete p.payloadBuf; } catch { /* never partitioned: ignorable */ }
+      }
+    }
+    return result;
+  } finally {
+    try { await fh.close(); } catch { /* already closed */ }
+  }
+}
+
+/**
+ * Per-parse state for the block/record interpreters.
+ *
+ * Kept separate from the byte buffer so the same interpreters serve both the
+ * whole-file path and the streaming path.
+ * @returns {object}
+ */
+function createParseState() {
+  return {
+    linkTypes: [],
+    /** Per-interface timestamp units per second (from if_tsresol). */
+    tsResolutions: [],
+    /** Version from the most recent Section Header Block (informational). */
+    sectionVersion: null,
+    stats: { malformed: 0, truncated: 0, unsupportedLink: 0, blocks: 0 },
+  };
+}
+
+/**
+ * Total length of the pcapng block starting at `off`.
+ *
+ * Returns 0 when the header itself is not fully available yet (the caller
+ * should read more), or -1 when the declared length is structurally invalid.
+ *
+ * @param {Buffer} buf
+ * @param {number} off
+ * @param {number} avail bytes available in buf
+ * @returns {number}
+ */
+function pcapngBlockLength(buf, off, avail) {
+  if (avail - off < 12) return 0;
+  const blockType = buf.readUInt32LE(off);
+  const isShb = blockType === PCAPNG_SHB;
+  // Only the SHB carries its own endianness marker; everything else follows it.
+  const le = isShb ? buf.readUInt32LE(off + 8) === 0x1a2b3c4d : true;
+  const totalLen = le ? buf.readUInt32LE(off + 4) : buf.readUInt32BE(off + 4);
+  const minLen = isShb ? 12 : (blockType === 0x00000001 ? 20 : 12);
+  if (!Number.isFinite(totalLen) || totalLen < minLen) return -1;
+  return totalLen;
+}
+
+/**
+ * Interpret one complete pcapng block in place.
+ * @param {Buffer} buf
+ * @param {number} off
+ * @param {number} totalLen
+ * @param {object} state parse state (mutated)
+ * @param {Array<object>} packets output list (mutated)
+ * @param {number} maxPackets stop appending beyond this
+ */
+function consumePcapngBlock(buf, off, totalLen, state, packets, maxPackets) {
+  const { stats } = state;
+  const blockType = buf.readUInt32LE(off);
+
+  if (blockType === PCAPNG_SHB) {
+    // The SHB carries no link type: its layout is
+    //   type(4) len(4) byte-order-magic(4) major(2) minor(2)
+    //   section-length(8) options…
+    // Reading a link type here would land in the options area and yield
+    // garbage. The real link type lives in each Interface Description Block.
+    const le = buf.readUInt32LE(off + 8) === 0x1a2b3c4d;
+    const major = le ? buf.readUInt16LE(off + 12) : buf.readUInt16BE(off + 12);
+    const minor = le ? buf.readUInt16LE(off + 14) : buf.readUInt16BE(off + 14);
+    state.sectionVersion = { major, minor };
+    // A new section resets the per-interface link types and resolutions.
+    state.linkTypes.length = 0;
+    state.tsResolutions.length = 0;
+    stats.blocks++;
+    return;
+  }
+
+  if (blockType === 0x00000001) {
+    // Interface Description Block:
+    //   type(4) len(4) linktype(2@8) reserved(2@10) snaplen(4@12) options…
+    const linkType = buf.readUInt16LE(off + 8);
+    state.linkTypes.push(linkType);
+    // Option 9 (if_tsresol) gives the timestamp resolution. Its absence means
+    // the pcapng default of 10^-6 (microseconds) — but dumpcap/Npcap write
+    // nanoseconds, so reading this is required for correct wall-clock times.
+    state.tsResolutions.push(readTsResolution(buf, off + 16, off + totalLen - 4));
+    stats.blocks++;
+    return;
+  }
+
+  if (blockType === 0x00000006) { // Enhanced Packet Block
+    if (off + 28 > buf.length) { stats.truncated++; return; }
+    const capLen = buf.readUInt32LE(off + 20);
+    const linkType = state.linkTypes[state.linkTypes.length - 1] ?? LINKTYPE_ETHERNET;
+    const dataStart = off + 28;
+    if (capLen > totalLen - 32 || dataStart + capLen > buf.length) {
+      stats.truncated++;
+      return;
+    }
+    const tsHigh = buf.readUInt32LE(off + 12);
+    const tsLow = buf.readUInt32LE(off + 16);
+    // Convert with the interface's own resolution (dumpcap writes nanoseconds;
+    // the pcapng default is microseconds).
+    const units = state.tsResolutions[state.tsResolutions.length - 1] || 1e6;
+    const tsSec = (tsHigh * 4294967296 + tsLow) / units;
+    const pkt = decodeByLinkType(buf.subarray(dataStart, dataStart + capLen), linkType, tsSec, stats);
+    if (pkt && packets.length < maxPackets) packets.push(pkt);
+    stats.blocks++;
+    return;
+  }
+
+  if (blockType === 0x00000003) { // Simple Packet Block
+    const linkType = state.linkTypes[state.linkTypes.length - 1] ?? LINKTYPE_ETHERNET;
+    const origLen = buf.readUInt32LE(off + 8);
+    const dataStart = off + 12;
+    const capLen = Math.min(origLen, totalLen - 16);
+    if (dataStart + capLen <= buf.length) {
+      const pkt = decodeByLinkType(buf.subarray(dataStart, dataStart + capLen), linkType, 0, stats);
+      if (pkt && packets.length < maxPackets) packets.push(pkt);
+    }
+    stats.blocks++;
+    return;
+  }
+
+  // Interface Statistics / Name Resolution / anything else: count and skip.
+  stats.blocks++;
 }
 
 /**
  * pcapng format (what `pktmon etl2pcap` writes).
  * @param {Buffer} buf
  * @param {number} maxPackets
+ * @param {object} [opts]
  * @returns {object}
  */
 function parsePcapng(buf, maxPackets, opts = {}) {
-  // Every section has its own endianness; the SHB magic tells us which.
   let off = 0;
   const packets = [];
-  const stats = { malformed: 0, truncated: 0, unsupportedLink: 0, blocks: 0 };
-  const linkTypes = [];
-  /** Per-interface timestamp units per second (from if_tsresol). */
-  const tsResolutions = [];
-  /** Version from the most recent Section Header Block (informational). */
-  let sectionVersion = null;
+  const state = createParseState();
 
   while (off + 12 <= buf.length && packets.length < maxPackets) {
-    const blockType = buf.readUInt32LE(off);
-    if (blockType === PCAPNG_SHB) {
-      const bom = buf.readUInt32LE(off + 8);
-      const le = bom === 0x1a2b3c4d;
-      // Verify trailer matches (structural sanity check).
-      const totalLen = le ? buf.readUInt32LE(off + 4) : buf.readUInt32BE(off + 4);
-      if (!Number.isFinite(totalLen) || totalLen < 12 || off + totalLen > buf.length) {
-        stats.truncated++;
-        break;
-      }
-      // The SHB carries no link type: its layout is
-      //   type(4) len(4) byte-order-magic(4) major(2) minor(2)
-      //   section-length(8) options…
-      // Reading a link type here would land in the options area and yield
-      // garbage. The real link type lives in each Interface Description Block.
-      const major = le ? buf.readUInt16LE(off + 12) : buf.readUInt16BE(off + 12);
-      const minor = le ? buf.readUInt16LE(off + 14) : buf.readUInt16BE(off + 14);
-      sectionVersion = { major, minor };
-      // A new section resets the per-interface link types.
-      linkTypes.length = 0;
-      tsResolutions.length = 0;
-      stats.blocks++;
-      off += totalLen;
-      continue;
-    }
-    if (blockType === 0x00000001) {
-      // Interface Description Block:
-      //   type(4) len(4) linktype(2@8) reserved(2@10) snaplen(4@12) options…
-      const totalLen = buf.readUInt32LE(off + 4);
-      if (!Number.isFinite(totalLen) || totalLen < 20 || off + totalLen > buf.length) {
-        stats.truncated++;
-        break;
-      }
-      const linkType = buf.readUInt16LE(off + 8);
-      linkTypes.push(linkType);
-      // Option 9 (if_tsresol) gives the timestamp resolution. Its absence means
-      // the pcapng default of 10^-6 (microseconds) — but dumpcap/Npcap write
-      // nanoseconds, so reading this is required for correct wall-clock times.
-      tsResolutions.push(readTsResolution(buf, off + 16, off + totalLen - 4));
-      stats.blocks++;
-      off += totalLen;
-      continue;
-    }
-    // For non-SHB blocks we must use the endianness of the last SHB. pktmon
-    // writes little-endian, which is also the only writer we support.
-    const le = true;
-    const totalLen = le ? buf.readUInt32LE(off + 4) : buf.readUInt32BE(off + 4);
-    if (!Number.isFinite(totalLen) || totalLen < 12 || off + totalLen > buf.length) {
-      stats.truncated++;
+    const totalLen = pcapngBlockLength(buf, off, buf.length);
+    if (totalLen <= 0 || off + totalLen > buf.length) {
+      state.stats.truncated++;
       break;
     }
-    if (blockType === 0x00000006) { // Enhanced Packet Block
-      const capLen = buf.readUInt32LE(off + 20);
-      const linkType = linkTypes[linkTypes.length - 1] ?? LINKTYPE_ETHERNET;
-      const dataStart = off + 28;
-      if (capLen > totalLen - 32 || dataStart + capLen > buf.length) {
-        stats.truncated++;
-        off += totalLen;
-        continue;
-      }
-      const data = buf.subarray(dataStart, dataStart + capLen);
-      const tsHigh = buf.readUInt32LE(off + 12);
-      const tsLow = buf.readUInt32LE(off + 16);
-      // Convert with the interface's own resolution (dumpcap writes nanoseconds;
-      // the pcapng default is microseconds).
-      const units = tsResolutions[tsResolutions.length - 1] || 1e6;
-      const tsSec = (tsHigh * 4294967296 + tsLow) / units;
-      const pkt = decodeByLinkType(data, linkType, tsSec, stats);
-      if (pkt) packets.push(pkt);
-      stats.blocks++;
-    } else if (blockType === 0x00000003) { // Simple Packet Block
-      const linkType = linkTypes[linkTypes.length - 1] ?? LINKTYPE_ETHERNET;
-      const origLen = buf.readUInt32LE(off + 8);
-      const dataStart = off + 12;
-      const capLen = Math.min(origLen, totalLen - 16);
-      if (dataStart + capLen <= buf.length) {
-        const pkt = decodeByLinkType(buf.subarray(dataStart, dataStart + capLen), linkType, 0, stats);
-        if (pkt) packets.push(pkt);
-      }
-      stats.blocks++;
-    } else if (blockType === 0x00000005 || blockType === 0x00000004) {
-      // Interface Statistics / Name Resolution: nothing to decode here.
-      stats.blocks++;
-    } else {
-      stats.blocks++;
-    }
+    consumePcapngBlock(buf, off, totalLen, state, packets, maxPackets);
     off += totalLen;
   }
-  return assemble(packets, stats, {
+
+  return assemble(packets, state.stats, {
     format: 'pcapng',
-    linkType: linkTypes[linkTypes.length - 1] ?? null,
-    version: sectionVersion,
-    tsResolution: tsResolutions[tsResolutions.length - 1] ?? 1e6,
+    linkType: state.linkTypes[state.linkTypes.length - 1] ?? null,
+    version: state.sectionVersion,
+    tsResolution: state.tsResolutions[state.tsResolutions.length - 1] ?? 1e6,
   }, opts);
 }
 

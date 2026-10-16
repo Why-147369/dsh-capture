@@ -461,6 +461,20 @@ try {
   check('pcap.js 读取 if_tsresol（时间戳分辨率）',
     /function readTsResolution/.test(pcapSrc) && /if_tsresol|tsResolutions/.test(pcapSrc),
     'readTsResolution + tsResolutions');
+
+  check('pcap.js 提供流式解析入口',
+    /export async function parseCaptureStream/.test(pcapSrc) && /class ChunkReader/.test(pcapSrc),
+    'parseCaptureStream + ChunkReader');
+
+  // 路由与工具层必须真的用上流式（否则大文件仍撞整读上限）
+  const routesSrc2 = fs.readFileSync(path.join(INST, 'lib', 'routes.js'), 'utf8');
+  check('路由层接入流式（shouldStream + parseCaptureStream）',
+    /shouldStream/.test(routesSrc2) && /parseCaptureStream/.test(routesSrc2),
+    'analyzeFile / packets / export 均按阈值分流');
+  const idxSrc2 = fs.readFileSync(path.join(INST, 'lib', 'index.js'), 'utf8');
+  check('工具层接入流式（parseMaybeStream）',
+    /parseMaybeStream/.test(idxSrc2) && /STREAM_THRESHOLD_BYTES/.test(idxSrc2),
+    'analyzeBounded / exportCapture 按阈值分流');
 }
 
 say('');

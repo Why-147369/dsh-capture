@@ -19,7 +19,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
-import { parseCapture, DNS_TYPES, isoTime } from './pcap.js';
+import { parseCapture, parseCaptureStream, DNS_TYPES, isoTime } from './pcap.js';
 import { status } from './pktmon.js';
 import { probeEnvironment } from './perm.js';
 import { listInterfaces, pickDefaultInterface, invalidateInterfaceCache } from './npcap.js';
@@ -27,6 +27,10 @@ import { startCaptureFlow, stopCaptureFlow, liveStatus } from './tools.js';
 
 /** Read at most this many bytes into memory when analyzing a capture. */
 const MAX_ANALYZE_BYTES = 96 * 1024 * 1024;
+/** Above this size a capture is parsed by streaming instead of read whole. */
+const STREAM_THRESHOLD_BYTES = 16 * 1024 * 1024;
+/** Absolute streaming ceiling — beyond this the caller must trim the file. */
+const MAX_STREAM_BYTES = 2 * 1024 * 1024 * 1024;
 /** Max packets parsed in one request. */
 const MAX_ANALYZE_PACKETS = 120000;
 /** Cap for the raw file download route. */
@@ -151,26 +155,50 @@ function guard(fn) {
 }
 
 /**
- * Build the analyzed summary from a capture file.
- * @param {string} full
- * @returns {object}
+ * Decide whether a capture should be parsed by streaming rather than read whole.
+ * @param {number} size bytes
+ * @returns {boolean}
  */
-function analyzeFile(full, opts = {}) {
+function shouldStream(size) {
+  return size > STREAM_THRESHOLD_BYTES;
+}
+
+/**
+ * Build the analyzed summary from a capture file.
+ *
+ * Small files use the in-memory parser (fastest); anything above the streaming
+ * threshold is read in chunks so peak memory no longer tracks file size. The
+ * output shape is identical either way.
+ *
+ * @param {string} full
+ * @param {object} [opts] reassembly knobs
+ * @returns {Promise<object>}
+ */
+async function analyzeFile(full, opts = {}) {
   const size = statSync(full).size;
-  if (size > MAX_ANALYZE_BYTES) {
+  const stream = shouldStream(size);
+  if (!stream && size > MAX_ANALYZE_BYTES) {
     return {
       ok: false,
       error: `文件 ${(size / 1048576).toFixed(1)} MB 超过在线分析上限 ${(MAX_ANALYZE_BYTES / 1048576).toFixed(0)} MB。请先裁剪或改用其他工具处理。`,
     };
   }
-  const buf = readFileSync(full);
-  const parsed = parseCapture(buf, { maxPackets: MAX_ANALYZE_PACKETS, ...opts });
+  if (stream && size > MAX_STREAM_BYTES) {
+    return {
+      ok: false,
+      error: `文件 ${(size / 1073741824).toFixed(2)} GB 超过流式分析上限 ${(MAX_STREAM_BYTES / 1073741824).toFixed(1)} GB。请先裁剪。`,
+    };
+  }
+  const parsed = stream
+    ? await parseCaptureStream(full, { maxPackets: MAX_ANALYZE_PACKETS, ...opts })
+    : parseCapture(readFileSync(full), { maxPackets: MAX_ANALYZE_PACKETS, ...opts });
   const { packets, streams, ...rest } = parsed;
   // Packets themselves are large; return counts and only a small head sample.
   return {
     ok: true,
     file: basename(full),
     sizeBytes: size,
+    streamed: stream,
     ...rest,
     // Flattened HTTP request/response pairs — this is what the panel renders.
     transactions: (rest.httpTransactions || []).map((t) => ({
@@ -331,19 +359,20 @@ export function mountRoutes(ctx, config) {
       }
       const full = resolveId(id);
       if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件（id 无效或已被删除）。' }); return; }
-      json(res, 200, analyzeFile(full, parseOpts));
+      json(res, 200, await analyzeFile(full, parseOpts));
     })],
 
     ['/dsh-capture/flows', ['GET'], guard(async (req, res) => {
       const url = new URL(req.url, 'http://127.0.0.1');
       const full = resolveId(url.searchParams.get('id') || '');
       if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件。' }); return; }
-      const parsed = analyzeFile(full, parseOpts);
+      const parsed = await analyzeFile(full, parseOpts);
       if (!parsed.ok) { json(res, 400, parsed); return; }
       const q = (url.searchParams.get('q') || '').toLowerCase();
       const filterFn = (s) => !q || String(s).toLowerCase().includes(q);
       json(res, 200, {
         ok: true,
+        streamed: parsed.streamed === true,
         meta: parsed.meta,
         reassembly: parsed.reassembly,
         talkers: parsed.talkers.filter((t) => filterFn(t.src) || filterFn(t.dst)),
@@ -432,7 +461,7 @@ export function mountRoutes(ctx, config) {
       const url = new URL(req.url, 'http://127.0.0.1');
       const full = resolveId(url.searchParams.get('id') || '');
       if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件。' }); return; }
-      const parsed = analyzeFile(full, parseOpts);
+      const parsed = await analyzeFile(full, parseOpts);
       if (!parsed.ok) { json(res, 400, parsed); return; }
 
       const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
@@ -444,9 +473,10 @@ export function mountRoutes(ctx, config) {
 
       // Re-parse just for the packet rows; analyzeFile intentionally returns
       // only a head sample to keep the summary small. Reassembly is skipped
-      // here — the row view only needs per-packet facts.
-      const raw = readFileSync(full);
-      const all = parseCapture(raw, { maxPackets: MAX_ANALYZE_PACKETS, reassemble: false });
+      // here — the row view only needs per-packet facts. Large files stream.
+      const all = shouldStream(statSync(full).size)
+        ? await parseCaptureStream(full, { maxPackets: MAX_ANALYZE_PACKETS, reassemble: false })
+        : parseCapture(readFileSync(full), { maxPackets: MAX_ANALYZE_PACKETS, reassemble: false });
       let rows = all.packets.map((p, index) => ({
         index,
         ts: p.ts,
@@ -487,8 +517,10 @@ export function mountRoutes(ctx, config) {
       const full = resolveId(url.searchParams.get('id') || '');
       if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件。' }); return; }
       const format = (url.searchParams.get('format') || 'csv').toLowerCase();
-      const raw = readFileSync(full);
-      const parsed = parseCapture(raw, { maxPackets: MAX_ANALYZE_PACKETS, reassemble: false });
+      // Tabular export needs every packet but no reassembly; large files stream.
+      const parsed = shouldStream(statSync(full).size)
+        ? await parseCaptureStream(full, { maxPackets: MAX_ANALYZE_PACKETS, reassemble: false })
+        : parseCapture(readFileSync(full), { maxPackets: MAX_ANALYZE_PACKETS, reassemble: false });
       const base = basename(full).replace(/\.[^.]+$/, '');
 
       if (format === 'csv') {
@@ -564,7 +596,7 @@ export function mountRoutes(ctx, config) {
       try { re = new RegExp(pattern, 'i'); }
       catch (e) { json(res, 400, { ok: false, error: `正则无效：${e.message}` }); return; }
 
-      const parsed = analyzeFile(full, parseOpts);
+      const parsed = await analyzeFile(full, parseOpts);
       if (!parsed.ok) { json(res, 400, parsed); return; }
       const limit = Math.min(300, Math.max(1, Number(url.searchParams.get('limit')) || 100));
       const hit = (s) => re.test(String(s ?? ''));

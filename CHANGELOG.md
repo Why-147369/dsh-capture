@@ -5,6 +5,40 @@
 > **状态说明**：本插件**未开发完成**，处于**测试阶段**。在 1.0.0 之前，
 > API、配置项与文件格式均可能在不通知的情况下变更。
 
+## [0.6.0] — 2026-10-16
+
+本版本补上最后一块边界能力：**大文件流式解析**。此前分析必须整文件读入内存
+（上限 96 MB），现在超过 16 MB 的文件改为分块读取，峰值内存不再随文件大小增长。
+
+### 新增
+
+- **流式解析 `parseCaptureStream(path, opts)`**（`lib/pcap.js`）
+  - `ChunkReader` 按块读取（默认 4 MB，可用 `chunkBytes` 调），只保留
+    「当前块 + 至多一个完整 block/record」，峰值内存与文件大小解耦
+  - pcapng 与经典 pcap 两条路径都支持；块/记录跨 chunk 边界由 carry 缓冲
+    拼接处理，已用 4 KB / 8 KB / 64 KB 极小 chunk 验证
+  - 输出与整读路径**逐字段等价**（含 stats、重组统计、SNI/DNS、HTTP 事务、
+    TLS 详情、包列表），两者共用同一套 block/record 解释器
+  - 重组完成后释放 `payloadBuf` 视图，让底层 chunk 能被回收
+- **路由与工具层接线**：`/analyze`、`/flows`、`/search`、`/packets`、`/export`
+  与 `capture_analyze` / `capture_search` / `capture_export` 均按阈值分流：
+  ≤ 16 MB 整读（最快），更大则流式。响应新增 `streamed` 字段表明走了哪条路径
+  - in-memory 的 `maxAnalyzeBytes` 上限只作用于小文件分支
+  - 流式分支另有 2 GB 硬上限，超过则明确报错而不是尝试读入
+- **测试 `test/streaming.test.mjs`（9 组）**：双格式等价性、跨边界 chunk、
+  `maxPackets`、截断文件、非法输入、流式下的重组、**路由接线**
+  （18.3 MB 文件经 `/analyze` 与 `/packets` 走流式）
+
+### 变更
+
+- `pcapng` 的 block 处理拆成 `pcapngBlockLength` / `consumePcapngBlock` +
+  `createParseState`，整读与流式共用，避免两份实现漂移
+- 装机验证 45 → **48 项**（新增流式入口、路由接入、工具接入三项）
+
+### 修复
+
+- 经典 pcap 解析里两处未使用的局部变量（`readU16` / `origLen`）随重构清理
+
 ## [0.5.0] — 2026-10-16
 
 本版本补齐工程面与工具面：新增两个 agent 工具、类型声明、结构化日志、

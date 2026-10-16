@@ -20,7 +20,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
-import { parseCapture, DNS_TYPES, isoTime } from './pcap.js';
+import { parseCapture, parseCaptureStream, DNS_TYPES, isoTime } from './pcap.js';
 import { mountRoutes } from './routes.js';
 import { clearFilters } from './pktmon.js';
 import { probeEnvironment } from './perm.js';
@@ -432,7 +432,7 @@ function registerTools(ctx, cfg, log = null) {
       const full = resolveCaptureId(String(args?.id ?? ''));
       if (!full) return { ok: false, error: 'capture id 无效或文件已删除。先用 capture_list 获取有效 id。' };
       const topN = Math.min(100, Math.max(1, Number(args?.topN) || 20));
-      return analyzeBounded(full, topN, cfg);
+      return await analyzeBounded(full, topN, cfg);
     },
   });
 
@@ -472,7 +472,7 @@ function registerTools(ctx, cfg, log = null) {
       const q = String(args?.query ?? '').trim().toLowerCase();
       if (!q) return { ok: false, error: 'query 不能为空。' };
       const limit = Math.min(200, Math.max(1, Number(args?.limit) || 50));
-      return searchCapture(full, q, limit, cfg);
+      return await searchCapture(full, q, limit, cfg);
     },
   });
 
@@ -537,7 +537,7 @@ function registerTools(ctx, cfg, log = null) {
         }];
       },
     },
-    execute: async (args) => exportCapture(String(args?.id ?? ''), String(args?.format ?? 'csv').toLowerCase(), cfg),
+    execute: async (args) => await exportCapture(String(args?.id ?? ''), String(args?.format ?? 'csv').toLowerCase(), cfg),
   });
 
   return () => {
@@ -557,6 +557,33 @@ function maxPacketsFrom(cfg) {
   return Number.isFinite(n) && n > 0 ? n : DEFAULTS.maxAnalyzePackets;
 }
 
+/** Above this size a capture is parsed by streaming instead of read whole. */
+const STREAM_THRESHOLD_BYTES = 16 * 1024 * 1024;
+/** Absolute streaming ceiling — beyond this the caller must trim the file. */
+const MAX_STREAM_BYTES = 2 * 1024 * 1024 * 1024;
+
+/**
+ * Parse a capture with the cheapest strategy that fits it.
+ *
+ * Small files are read whole (fastest); large ones stream so peak memory does
+ * not track file size. Output shape is identical.
+ *
+ * @param {string} full
+ * @param {object} parseOpts reassembly knobs
+ * @param {number} maxPackets
+ * @returns {Promise<object>}
+ */
+async function parseMaybeStream(full, parseOpts, maxPackets) {
+  const size = statSync(full).size;
+  if (size > STREAM_THRESHOLD_BYTES) {
+    if (size > MAX_STREAM_BYTES) {
+      throw new Error(`文件 ${(size / 1073741824).toFixed(2)} GB 超过流式分析上限 ${(MAX_STREAM_BYTES / 1073741824).toFixed(1)} GB。请先裁剪。`);
+    }
+    return { parsed: await parseCaptureStream(full, { maxPackets, ...parseOpts }), streamed: true };
+  }
+  return { parsed: parseCapture(readFileSync(full), { maxPackets, ...parseOpts }), streamed: false };
+}
+
 /**
  * Analyze a capture with hard memory bounds.
  * @param {string} full absolute path resolved from a known id
@@ -564,10 +591,12 @@ function maxPacketsFrom(cfg) {
  * @param {object} cfg
  * @returns {object}
  */
-function analyzeBounded(full, topN, cfg) {
+async function analyzeBounded(full, topN, cfg) {
   const st = statSync(full);
   const cap = Number.isFinite(cfg?.maxAnalyzeBytes) ? cfg.maxAnalyzeBytes : DEFAULTS.maxAnalyzeBytes;
-  if (st.size > cap) {
+  // The in-memory cap only applies below the streaming threshold; larger files
+  // are read in chunks, so they are not bounded by maxAnalyzeBytes.
+  if (st.size <= STREAM_THRESHOLD_BYTES && st.size > cap) {
     return {
       ok: false,
       error: `抓包文件 ${(st.size / 1048576).toFixed(1)} MB 超过分析上限 ${(cap / 1048576).toFixed(0)} MB。可用 filters 缩小抓包范围，或提高插件 config 的 maxAnalyzeBytes。`,
@@ -575,12 +604,21 @@ function analyzeBounded(full, topN, cfg) {
       sizeBytes: st.size,
     };
   }
-  const parsed = parseCapture(readFileSync(full), { maxPackets: maxPacketsFrom(cfg), ...parseOptsFrom(cfg) });
+  let parsed;
+  let streamed = false;
+  try {
+    const r = await parseMaybeStream(full, parseOptsFrom(cfg), maxPacketsFrom(cfg));
+    parsed = r.parsed;
+    streamed = r.streamed;
+  } catch (e) {
+    return { ok: false, error: `解析失败：${e.message}`, file: basename(full), sizeBytes: st.size };
+  }
   const { packets, http, dns, sni, talkers, topPorts, meta, stats, tls, streams, httpTransactions, reassembly } = parsed;
   return {
     ok: true,
     file: basename(full),
     sizeBytes: st.size,
+    streamed,
     meta,
     stats,
     reassembly,
@@ -617,8 +655,8 @@ function analyzeBounded(full, topN, cfg) {
  * @param {object} cfg
  * @returns {object}
  */
-function searchCapture(full, q, limit, cfg) {
-  const parsed = analyzeBounded(full, 100, cfg);
+async function searchCapture(full, q, limit, cfg) {
+  const parsed = await analyzeBounded(full, 100, cfg);
   if (!parsed.ok) return parsed;
   const hit = (s) => String(s ?? '').toLowerCase().includes(q);
   return {
@@ -724,20 +762,23 @@ function statusTool(sessionId, cfg) {
  * @param {object} cfg normalized config
  * @returns {object}
  */
-function exportCapture(id, format, cfg) {
+async function exportCapture(id, format, cfg) {
   const full = resolveCaptureId(String(id ?? ''));
   if (!full) return { ok: false, error: 'capture id 无效或文件已删除。先用 capture_list 获取有效 id。' };
   const fmt = format === 'json' ? 'json' : 'csv';
 
   let parsed;
+  let streamed = false;
   try {
     const st = statSync(full);
     const cap = Number.isFinite(cfg?.maxAnalyzeBytes) ? cfg.maxAnalyzeBytes : DEFAULTS.maxAnalyzeBytes;
-    if (st.size > cap) {
+    if (st.size <= STREAM_THRESHOLD_BYTES && st.size > cap) {
       return { ok: false, error: `抓包文件 ${(st.size / 1048576).toFixed(1)} MB 超过分析上限 ${(cap / 1048576).toFixed(0)} MB。` };
     }
     // Reassembly off: the tabular export is per-packet, and this keeps memory flat.
-    parsed = parseCapture(readFileSync(full), { maxPackets: maxPacketsFrom(cfg), reassemble: false });
+    const r = await parseMaybeStream(full, { ...parseOptsFrom(cfg), reassemble: false }, maxPacketsFrom(cfg));
+    parsed = r.parsed;
+    streamed = r.streamed;
   } catch (e) {
     return { ok: false, error: `解析失败：${e.message}` };
   }
