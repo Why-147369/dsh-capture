@@ -1,6 +1,8 @@
 # 安装/同步产生的备份与日志
 backup-dsh-capture-*/
+backup-repoint-*/
 install-dsh-capture.log
+repoint-dsh-capture.log
 sync.log
 verify-installed.log
 
