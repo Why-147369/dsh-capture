@@ -20,7 +20,9 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, wri
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { parseCapture, DNS_TYPES } from './pcap.js';
-import { probeBackend, setFilters, clearFilters, startCapture, stopCapture, etl2pcap, status } from './pktmon.js';
+import { status } from './pktmon.js';
+import { probeEnvironment } from './perm.js';
+import { startCaptureFlow, stopCaptureFlow } from './tools.js';
 
 /** Read at most this many bytes into memory when analyzing a capture. */
 const MAX_ANALYZE_BYTES = 96 * 1024 * 1024;
@@ -195,7 +197,7 @@ export function mountRoutes(ctx, config) {
   // the handler enforces the method itself.
   const routes = [
     ['/dsh-capture/status', ['GET'], guard(async (_req, res) => {
-      const backend = await probeBackend();
+      const backend = await probeEnvironment();
       const state = readState();
       json(res, 200, { ok: true, backend, state, dir });
     })],
@@ -206,73 +208,33 @@ export function mountRoutes(ctx, config) {
 
     ['/dsh-capture/start', ['POST'], guard(async (req, res) => {
       const body = await readJson(req);
-      const state = readState();
-      if (state.running) {
-        json(res, 409, { ok: false, error: '已有抓包在进行中，请先停止。', state });
-        return;
-      }
-      const name = /^[A-Za-z0-9._-]{1,48}$/.test(String(body.name || ''))
-        ? String(body.name)
-        : `capture-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-      const filters = Array.isArray(body.filters)
-        ? body.filters.filter((f) => f && (f.ip || f.port || f.protocol)).slice(0, 16)
-        : [];
-      const filterResult = await setFilters(filters);
-      const startResult = await startCapture({
-        dir,
-        name,
-        maxPktSize: Number(body.maxPktSize) || undefined,
+      // Reuse the tool-layer flow so the HTTP panel and the agent tools share
+      // one implementation, including the elevated-helper path.
+      const result = await startCaptureFlow({
+        name: body.name,
+        filters: Array.isArray(body.filters) ? body.filters : [],
+        maxPktSize: Number(body.maxPktSize) || cfg.defaultPktSize,
         maxFileMb: Number(body.maxFileMb) || undefined,
-        components: Array.isArray(body.components) ? body.components : undefined,
+        elevate: cfg.useElevation !== false,
       });
-      if (!startResult.ok) {
-        await clearFilters();
-        json(res, 500, {
+      if (!result.ok) {
+        json(res, result.declined ? 403 : 500, {
           ok: false,
-          error: '启动抓包失败。若提示权限不足，请以管理员身份运行 DSH。',
-          filterLog: filterResult.log,
-          log: startResult.log,
+          declined: result.declined === true,
+          error: result.error || '启动抓包失败。',
+          log: result.log || [],
+          elevationError: result.elevationError,
         });
         return;
       }
-      const next = {
-        running: true,
-        etl: startResult.etl,
-        pcapng: null,
-        startedAt: Date.now(),
-        filters,
-        name,
-        log: [...filterResult.log, ...startResult.log],
-      };
-      writeState(next);
-      json(res, 200, { ok: true, state: next });
+      json(res, 200, { ok: true, state: result.state, elevated: result.elevated === true, hint: result.hint });
     })],
 
     ['/dsh-capture/stop', ['POST'], guard(async (_req, res) => {
-      const state = readState();
-      const stopResult = await stopCapture();
-      const clearResult = await clearFilters();
-      let convert = { ok: false, out: null, size: null, log: [] };
-      if (state.etl && existsSync(state.etl)) {
-        const out = state.etl.replace(/\.etl$/i, '.pcapng');
-        convert = await etl2pcap(state.etl, out);
-      }
-      const next = {
-        ...state,
-        running: false,
-        pcapng: convert.out || null,
-        stoppedAt: Date.now(),
-        log: [...(state.log || []), ...stopResult.log, ...clearResult.log, ...convert.log].slice(-60),
-      };
-      writeState(next);
-      const hit = convert.out ? scanCaptures().find((c) => c.name === basename(convert.out)) : null;
-      json(res, 200, {
-        ok: stopResult.ok,
-        state: next,
-        pcapng: convert.out,
-        pcapngId: hit ? hit.id : null,
-        pcapngSize: convert.size,
-      });
+      // Same shared flow as the tool layer: a capture started through the
+      // elevated helper is stopped through it too.
+      const result = await stopCaptureFlow({ elevate: cfg.useElevation !== false });
+      json(res, result.ok ? 200 : 500, result);
     })],
 
     // One path, two methods: `id` arrives from the query string (GET) or the
@@ -340,6 +302,146 @@ export function mountRoutes(ctx, config) {
 
     ['/dsh-capture/raw-status', ['GET'], guard(async (_req, res) => {
       json(res, 200, { ok: true, text: await status() });
+    })],
+
+    // Packet-level browsing with paging and filters. The summary routes are
+    // for understanding a capture; this one is for reading individual packets
+    // without pulling the whole file into the browser.
+    ['/dsh-capture/packets', ['GET'], guard(async (req, res) => {
+      const url = new URL(req.url, 'http://127.0.0.1');
+      const full = resolveId(url.searchParams.get('id') || '');
+      if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件。' }); return; }
+      const parsed = analyzeFile(full);
+      if (!parsed.ok) { json(res, 400, parsed); return; }
+
+      const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
+      const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 100));
+      const proto = (url.searchParams.get('proto') || '').toUpperCase();
+      const host = (url.searchParams.get('host') || '').toLowerCase();
+      const port = Number(url.searchParams.get('port')) || null;
+      const q = (url.searchParams.get('q') || '').toLowerCase();
+
+      // Re-parse just for the packet rows; analyzeFile intentionally returns
+      // only a head sample to keep the summary small.
+      const raw = readFileSync(full);
+      const all = parseCapture(raw, { maxPackets: MAX_ANALYZE_PACKETS });
+      let rows = all.packets.map((p, index) => ({
+        index,
+        ts: p.ts,
+        proto: p.proto,
+        src: p.src ?? null,
+        dst: p.dst ?? null,
+        sport: p.sport ?? null,
+        dport: p.dport ?? null,
+        bytes: p.bytes ?? 0,
+        sni: p.sni ?? null,
+        dns: p.dns ? p.dns.queries.map((x) => x.name) : null,
+        http: p.http ? (p.http.method ? `${p.http.method} ${p.http.path}` : `HTTP ${p.http.status}`) : null,
+        flags: p.flags ?? null,
+      }));
+      if (proto) rows = rows.filter((r) => r.proto === proto);
+      if (port) rows = rows.filter((r) => r.sport === port || r.dport === port);
+      if (host) rows = rows.filter((r) => [r.src, r.dst, r.sni, ...(r.dns || [])].some((v) => String(v || '').toLowerCase().includes(host)));
+      if (q) rows = rows.filter((r) => JSON.stringify(r).toLowerCase().includes(q));
+
+      json(res, 200, {
+        ok: true,
+        total: rows.length,
+        offset,
+        limit,
+        rows: rows.slice(offset, offset + limit),
+      });
+    })],
+
+    // Structured export. CSV opens in a spreadsheet; HAR opens in browser dev
+    // tools. Both are derived from the same parse as the summary.
+    ['/dsh-capture/export', ['GET'], guard(async (req, res) => {
+      const url = new URL(req.url, 'http://127.0.0.1');
+      const full = resolveId(url.searchParams.get('id') || '');
+      if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件。' }); return; }
+      const format = (url.searchParams.get('format') || 'csv').toLowerCase();
+      const raw = readFileSync(full);
+      const parsed = parseCapture(raw, { maxPackets: MAX_ANALYZE_PACKETS });
+      const base = basename(full).replace(/\.[^.]+$/, '');
+
+      if (format === 'csv') {
+        const esc = (v) => {
+          const s = v === null || v === undefined ? '' : String(v);
+          return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        };
+        const head = ['index', 'ts', 'proto', 'src', 'dst', 'sport', 'dport', 'bytes', 'sni', 'dns', 'http'];
+        const lines = [head.join(',')];
+        parsed.packets.forEach((p, i) => {
+          lines.push([
+            i, p.ts ?? '', p.proto ?? '', p.src ?? '', p.dst ?? '',
+            p.sport ?? '', p.dport ?? '', p.bytes ?? '',
+            p.sni ?? '',
+            p.dns ? p.dns.queries.map((x) => x.name).join(' ') : '',
+            p.http ? (p.http.method ? `${p.http.method} ${p.http.path}` : `HTTP ${p.http.status}`) : '',
+          ].map(esc).join(','));
+        });
+        const csv = '\uFEFF' + lines.join('\r\n'); // BOM so Excel reads UTF-8
+        res.writeHead(200, {
+          'content-type': 'text/csv; charset=utf-8',
+          'content-disposition': `attachment; filename="${base}-packets.csv"`,
+          'cache-control': 'no-store',
+          'content-length': String(Buffer.byteLength(csv)),
+        });
+        res.end(csv);
+        return;
+      }
+
+      if (format === 'json') {
+        const body = JSON.stringify({
+          file: basename(full),
+          meta: parsed.meta,
+          stats: parsed.stats,
+          talkers: parsed.talkers,
+          topPorts: parsed.topPorts,
+          dns: parsed.dns.map((d) => ({ ...d, type: DNS_TYPES[d.type] || String(d.type) })),
+          sni: parsed.sni,
+          http: parsed.http,
+        }, null, 2);
+        res.writeHead(200, {
+          'content-type': 'application/json; charset=utf-8',
+          'content-disposition': `attachment; filename="${base}-summary.json"`,
+          'cache-control': 'no-store',
+        });
+        res.end(body);
+        return;
+      }
+
+      json(res, 400, { ok: false, error: `不支持的导出格式 "${format}"（可用：csv、json）。` });
+    })],
+
+    // Regex search across derived views. Distinct from capture_search (plain
+    // substring via the tool layer) — this one is for the panel's advanced box.
+    ['/dsh-capture/search', ['GET'], guard(async (req, res) => {
+      const url = new URL(req.url, 'http://127.0.0.1');
+      const full = resolveId(url.searchParams.get('id') || '');
+      if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件。' }); return; }
+      const pattern = url.searchParams.get('pattern') || '';
+      if (!pattern) { json(res, 400, { ok: false, error: 'pattern 不能为空。' }); return; }
+      // User-supplied regex: bound the pattern length and reject a catastrophic
+      // backtracking shape by capping the input, not by trying to out-smart the
+      // engine. A bad pattern is reported rather than thrown.
+      if (pattern.length > 200) { json(res, 400, { ok: false, error: '正则表达式过长（上限 200 字符）。' }); return; }
+      let re;
+      try { re = new RegExp(pattern, 'i'); }
+      catch (e) { json(res, 400, { ok: false, error: `正则无效：${e.message}` }); return; }
+
+      const parsed = analyzeFile(full);
+      if (!parsed.ok) { json(res, 400, parsed); return; }
+      const limit = Math.min(300, Math.max(1, Number(url.searchParams.get('limit')) || 100));
+      const hit = (s) => re.test(String(s ?? ''));
+      json(res, 200, {
+        ok: true,
+        pattern,
+        dns: parsed.dns.filter((d) => hit(d.name)).slice(0, limit),
+        sni: parsed.sni.filter((s) => hit(s.name)).slice(0, limit),
+        http: parsed.http.filter((h) => hit(h.host) || hit(h.path) || hit(h.method)).slice(0, limit),
+        endpoints: parsed.talkers.filter((t) => hit(t.src) || hit(t.dst)).slice(0, limit),
+      });
     })],
   ];
 

@@ -40,6 +40,9 @@ const FILES = [
   'lib/pcap.js',
   'lib/pktmon.js',
   'lib/tools.js',
+  'lib/perm.js',
+  'lib/elevate.js',
+  'lib/run-elevated.ps1',
   'client/client.js',
 ];
 

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Capture — packet capture & traffic analysis",
+    "description": "Live capture via Windows pktmon, pcapng parsing, HTTP/DNS/TCP flow extraction, and agent tools for inspecting traffic."
+  }
+}

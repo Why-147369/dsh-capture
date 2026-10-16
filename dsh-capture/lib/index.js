@@ -19,9 +19,11 @@
  */
 import { readFileSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
+import z from '@deepseek-ai/schemastery';
 import { parseCapture, DNS_TYPES } from './pcap.js';
 import { mountRoutes } from './routes.js';
-import { probeBackend, clearFilters } from './pktmon.js';
+import { clearFilters } from './pktmon.js';
+import { probeEnvironment } from './perm.js';
 import {
   captureDir, listCaptures, resolveCaptureId,
   startCaptureFlow, stopCaptureFlow,
@@ -29,10 +31,76 @@ import {
 
 export const name = 'dsh-capture';
 
-/** Bytes read into memory for one analysis call. */
-const ANALYZE_CAP = 96 * 1024 * 1024;
-/** Packets parsed per analysis call. */
-const PACKET_CAP = 120000;
+/**
+ * Tunable settings, declared with the host's schemastery schema so the profile
+ * can validate and override them from `cordis.patch.yml` under this plugin's
+ * row; that patch layer survives plugin upgrades.
+ *
+ * Read values with `readConfig(config)` — schemastery resolves `.default(...)`
+ * layers, but a direct unit test may pass a plain object, so the reader is
+ * defensive about both shapes.
+ */
+export const Config = z.object({
+  /** Bytes read into memory for one analysis call. */
+  maxAnalyzeBytes: z.number().step(1).min(1).default(96 * 1024 * 1024),
+  /** Packets parsed per analysis call. */
+  maxAnalyzePackets: z.number().step(1).min(1).default(120000),
+  /**
+   * Try the one-shot elevated helper when DSH itself is not elevated.
+   * Set false to never show a UAC prompt.
+   */
+  useElevation: z.boolean().default(true),
+  /** Default per-packet capture size when a caller does not specify one. */
+  defaultPktSize: z.number().step(1).min(64).default(256),
+  /** Allow the download route to return raw capture bytes. */
+  allowDownload: z.boolean().default(true),
+});
+
+const DEFAULTS = {
+  maxAnalyzeBytes: 96 * 1024 * 1024,
+  maxAnalyzePackets: 120000,
+  useElevation: true,
+  defaultPktSize: 256,
+  allowDownload: true,
+};
+
+/**
+ * Read a config value, tolerating schemastery values, plain objects, and
+ * missing config alike.
+ * @param {object} config
+ * @param {string} key
+ * @returns {any}
+ */
+export function readConfigValue(config, key) {
+  const fallback = DEFAULTS[key];
+  if (!config || typeof config !== 'object') return fallback;
+  const raw = config[key];
+  if (raw === undefined || raw === null) return fallback;
+  // schemastery wraps values; unwrap defensively.
+  const unwrapped = (typeof raw === 'object' && typeof raw.get === 'function') ? raw.get() : raw;
+  if (unwrapped === undefined || unwrapped === null) return fallback;
+  if (typeof fallback === 'number') {
+    const n = Number(unwrapped);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  }
+  if (typeof fallback === 'boolean') return unwrapped !== false;
+  return unwrapped;
+}
+
+/**
+ * Normalize the whole config into plain values.
+ * @param {object} config
+ * @returns {object}
+ */
+function readConfig(config) {
+  return {
+    maxAnalyzeBytes: readConfigValue(config, 'maxAnalyzeBytes'),
+    maxAnalyzePackets: readConfigValue(config, 'maxAnalyzePackets'),
+    useElevation: readConfigValue(config, 'useElevation'),
+    defaultPktSize: readConfigValue(config, 'defaultPktSize'),
+    allowDownload: readConfigValue(config, 'allowDownload'),
+  };
+}
 
 let mounted = false;
 
@@ -42,7 +110,9 @@ let mounted = false;
  * @param {object} config optional profile override
  */
 export function apply(ctx, config) {
-  const cfg = config ?? {};
+  // Normalize once: schemastery gives a validated object, but a direct unit
+  // test may pass a plain object or nothing at all.
+  const cfg = readConfig(config);
 
   ctx.inject(['webServer'], (hostCtx) => {
     hostCtx.effect(() => {
@@ -87,7 +157,7 @@ function registerTools(ctx, cfg) {
   add({
     name: 'capture_probe',
     description:
-      '检查本机是否具备抓包能力（Windows 自带 pktmon）、是否缺管理员权限，以及抓包文件存放目录。在 capture_start 之前调用一次，失败时据此解释原因。',
+      '检查本机抓包能力：pktmon 是否可用、是否缺管理员权限、Npcap 安装与 AdminOnly 设置、可用的提权途径。在 capture_start 之前调用一次；抓包失败时也用它解释原因。',
     parameters: {},
     output: {
       schema: {
@@ -96,15 +166,28 @@ function registerTools(ctx, cfg) {
         required: true,
         properties: { ok: { type: 'boolean', required: true } },
       },
-      render: (_args, value) => [{
-        type: 'text',
-        text: `pktmon=${value.pktmonExists ? '存在' : '缺失'} | 可运行=${value.canRun ? '是' : '否'}`
-          + `${value.needsElevation ? ' | 需要管理员权限' : ''} | 目录=${value.dir ?? value.captureDir ?? ''}`
-          + (Array.isArray(value.notes) && value.notes.length ? `\n说明：${value.notes.join(' ')}` : ''),
-      }],
+      render: (_args, value) => {
+        const lines = [];
+        const flag = (b) => (b ? '是' : '否');
+        lines.push(`平台: ${value.platform} | 可抓包: ${flag(value.canCapture)} | 需提权才可抓: ${flag(value.canCaptureWithElevation)}`);
+        lines.push(`pktmon: 存在=${flag(value.pktmonExists)} 可用=${flag(value.pktmonUsable)} 需提权=${flag(value.pktmonNeedsElevation)}`);
+        if (value.npcap) {
+          lines.push(`Npcap: 已装=${flag(value.npcap.installed)} 驱动运行=${flag(value.npcap.driverRunning)} AdminOnly=${value.npcap.adminOnly ?? '未知'} 可非提权抓包=${flag(value.npcap.clickableCapture)}`);
+        }
+        if (value.cli && (value.cli.tshark || value.cli.dumpcap)) {
+          lines.push(`外部工具: tshark=${value.cli.tshark || '无'} dumpcap=${value.cli.dumpcap || '无'}`);
+        }
+        if (value.elevation) lines.push(`提权途径: 支持=${flag(value.elevation.supported)} (${value.elevation.mechanism})`);
+        lines.push(`目录: ${value.dir ?? ''}`);
+        if (Array.isArray(value.notes) && value.notes.length) {
+          lines.push('');
+          lines.push(...value.notes);
+        }
+        return [{ type: 'text', text: lines.join('\n') }];
+      },
     },
     execute: async () => {
-      const backend = await probeBackend();
+      const backend = await probeEnvironment();
       return { ...backend, ok: true, dir: captureDir() };
     },
   });
@@ -182,8 +265,10 @@ function registerTools(ctx, cfg) {
     execute: async (args) => startCaptureFlow({
       name: args?.name,
       filters: Array.isArray(args?.filters) ? args.filters : [],
-      maxPktSize: Number(args?.maxPktSize) || undefined,
+      maxPktSize: Number(args?.maxPktSize) || cfg.defaultPktSize,
       maxFileMb: Number(args?.maxFileMb) || undefined,
+      // Config can forbid UAC prompts entirely for unattended setups.
+      elevate: cfg.useElevation !== false,
     }),
   });
 
@@ -295,6 +380,16 @@ function registerTools(ctx, cfg) {
 }
 
 /**
+ * Packet cap for one parse call.
+ * @param {object} cfg normalized config
+ * @returns {number}
+ */
+function maxPacketsFrom(cfg) {
+  const n = Number(cfg?.maxAnalyzePackets);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULTS.maxAnalyzePackets;
+}
+
+/**
  * Analyze a capture with hard memory bounds.
  * @param {string} full absolute path resolved from a known id
  * @param {number} topN
@@ -303,7 +398,7 @@ function registerTools(ctx, cfg) {
  */
 function analyzeBounded(full, topN, cfg) {
   const st = statSync(full);
-  const cap = Number.isFinite(cfg?.maxAnalyzeBytes) ? cfg.maxAnalyzeBytes : ANALYZE_CAP;
+  const cap = Number.isFinite(cfg?.maxAnalyzeBytes) ? cfg.maxAnalyzeBytes : DEFAULTS.maxAnalyzeBytes;
   if (st.size > cap) {
     return {
       ok: false,
@@ -312,7 +407,7 @@ function analyzeBounded(full, topN, cfg) {
       sizeBytes: st.size,
     };
   }
-  const parsed = parseCapture(readFileSync(full), { maxPackets: PACKET_CAP });
+  const parsed = parseCapture(readFileSync(full), { maxPackets: maxPacketsFrom(cfg) });
   const { packets, http, dns, sni, talkers, topPorts, meta, stats } = parsed;
   return {
     ok: true,

@@ -37,21 +37,29 @@
 
 ### 已验证 ✅
 
-- Host 侧插件加载、9 条 `/dsh-capture/*` HTTP 路由注册与调用
-- 权限探测在非提权环境正确报 `needsElevation`
+- Host 侧插件加载、**12 条** `/dsh-capture/*` HTTP 路由注册与调用
+- 环境探测：pktmon 可用性、Npcap 安装与 `AdminOnly`、提权途径（非提权环境正确报 `需提权`）
 - 方法校验（`GET /start` → 405）、无效 id → 404、路径穿越 id → 404
 - **端到端**：合成 pcapng → `analyze` 正确解析出 SNI
+- **包级浏览**：分页、协议过滤、端口过滤
+- **导出**：CSV（带 BOM，表头正确）、JSON 摘要
+- **正则检索**：命中正确；无效正则返回 400 而不抛 500
 - 解析器自测：SNI + DNS 帧的包数 / TCP / UDP / 端口断言，含截断文件容错
 - Client bundle 契约（`module.exports`）、slot 注册（`settings.section`）
-- 图标与 manifest 契约
+- 图标与 manifest 契约（17 项）
+- 卸载 `disposeRoutes` 清空全部注册
+
+装机验证共 **21 项**，全部通过。
 
 ### 未验证 / 已知问题 ⚠️
 
-- **真实提权环境下的完整抓包链路**：本机 DSH 为非提权进程，`pktmon` 返回
-  `exit=5 无法与 PktMon 驱动程序通信。拒绝访问。`，因此「抓 → 停 → 转 → 析」这条链路**没有跑通过**
-- **Npcap 后端未接入**：本机已装 Npcap，但其 `AdminOnly=1`，
-  需改注册表（一次性提权）后才能非提权抓包；插件尚未走这条路
-- **IPv6 扩展头链**在真实流量下的表现未验证
+- **真实提权下的完整抓包链路未端到端验证**：开发机 DSH 为非提权，
+  提权助手（`run-elevated.ps1` + UAC）未在真机跑通
+  「提权 → 抓包 → 停止 → 转换 → 分析」全链。UAC 拒绝分支同样未经真机验证。
+- **Npcap 后端未接入**：只在探测层识别 Npcap 与 `AdminOnly`，
+  实际抓包仍走 pktmon；`AdminOnly=0` 后的免提权抓包路径尚未实现
+- IPv6 扩展头链在真实流量下未验证；大文件未做流式解析（整文件读入，上限 96 MB）
+- 抓包文件无自动清理 / 轮转策略
 - 仅 Windows 适配；macOS / Linux 未支持
 - 设置页 UI 的深浅主题适配仅按 token 规则编写，未在真实页面逐项核对
 
@@ -68,12 +76,43 @@ node install-dsh-capture.mjs
 ## 权限说明
 
 `pktmon` 需要管理员权限，这是内核层设计（驱动设备对象只对管理员开放），不是插件缺陷。
+实测在非提权下，连只读的 `pktmon filter list` 都返回
+`exit=5 无法与 PktMon 驱动程序通信。拒绝访问。`，`netsh trace` 同样被挡。
 
-**非提权下仍可用的部分**：`capture_analyze` / `capture_search` 对已有 pcapng 文件的解析完全正常。
+**三条路可选，插件会按环境自动选择：**
 
-**想免去管理员？** 两条路径（尚未实现，欢迎 PR）：
-1. 一次性把 Npcap 的 `AdminOnly` 改为 0，之后走 Npcap 即可非提权抓包
-2. 给插件加提权代理，只把 `pktmon start/stop` 委托出去
+1. **一次性提权（默认）**：插件只把 `pktmon start/stop` 委托给一个短命的提权助手，
+   弹出的 UAC 授权后助手立即退出 —— **DSH 本身始终保持普通权限**。
+   拒绝 UAC 也不会报错，面板会说明替代方案。无人值守环境可用
+   `useElevation: false` 关掉这条路径。
+2. **让 DSH 直接以管理员运行**：最简单，但整个会话（含所有插件与子进程）
+   都会继承提权令牌，安全性上不如第 1 条。
+3. **放宽 Npcap，长期免提权**：若已装 Npcap，可一次性把它设为允许标准用户访问：
+
+   ```powershell
+   # 以管理员身份执行一次
+   reg add "HKLM\SOFTWARE\WOW6432Node\Npcap" /v AdminOnly /t REG_DWORD /d 0 /f
+   ```
+
+   **代价**：本机任何用户都能抓包。多人共用电脑请自行权衡。
+   （说明：插件目前只在探测层识别该设置，**尚未接入 Npcap 抓包后端**。）
+
+**非提权下仍可用的部分**：`capture_analyze` / `capture_search` / `packets` /
+`export` 对已有 pcapng 文件的解析完全正常 —— 只有「实时抓」这一环受权限限制。
+
+## 配置
+
+在 profile 的 `cordis.patch.yml` 里给本插件行加 `config`（该层在插件升级后仍保留）：
+
+```yaml
+- id: dsh-capture
+  config:
+    maxAnalyzeBytes: 100663296   # 单次分析读入上限（字节），默认 96 MB
+    maxAnalyzePackets: 200000    # 单次解析包数上限，默认 120000
+    useElevation: true           # 非提权时是否经 UAC 委托抓包；无人值守可设 false
+    defaultPktSize: 256          # 默认每包截取字节数 64..262144
+    allowDownload: true          # 是否允许 /download 返回原始抓包字节
+```
 
 ## Agent 工具
 
@@ -90,12 +129,15 @@ node install-dsh-capture.mjs
 
 | 路径 | 方法 | 作用 |
 |---|---|---|
-| `/dsh-capture/status` | GET | 后端探测 + 当前会话状态 |
+| `/dsh-capture/status` | GET | 环境探测（pktmon / Npcap / 提权途径）+ 当前会话状态 |
 | `/dsh-capture/sessions` | GET | 已保存抓包列表 |
-| `/dsh-capture/start` | POST | 开始抓包 |
+| `/dsh-capture/start` | POST | 开始抓包（非提权时经 UAC 委托；拒绝则返回 403 + 说明） |
 | `/dsh-capture/stop` | POST | 停止并转换 |
 | `/dsh-capture/analyze` | GET/POST | 解析摘要 |
 | `/dsh-capture/flows` | GET | 会话/端口/DNS/SNI/HTTP，支持 `q=` 过滤 |
+| `/dsh-capture/packets` | GET | **包级浏览**：`offset`/`limit`/`proto`/`port`/`host`/`q` |
+| `/dsh-capture/export` | GET | **结构化导出**：`format=csv\|json` |
+| `/dsh-capture/search` | GET | **正则检索**：`pattern=`（长度上限 200） |
 | `/dsh-capture/download` | GET | 下载 pcapng |
 | `/dsh-capture/delete` | POST | 删除抓包 |
 | `/dsh-capture/raw-status` | GET | pktmon 过滤规则原文（排障用） |
@@ -117,8 +159,8 @@ node install-dsh-capture.mjs
 node sync-dsh-capture.mjs
 
 # 验证
-node verify-installed.mjs      # Host 侧 14 项
-node verify-icon.cjs           # 图标与 manifest 16 项
+node verify-installed.mjs            # 装机回归 21 项
+node verify-icon.cjs                 # 图标与 manifest 17 项
 node dsh-capture/test/selftest.mjs   # 解析器自测
 ```
 
@@ -129,14 +171,17 @@ dsh-capture/
 ├── package.json
 ├── cordis.patch.yml
 ├── icon.svg
-├── locale/zh.json
+├── locale/{en,zh}.json
 ├── lib/
-│   ├── index.js     # 入口：挂路由 + 注册 agent 工具
-│   ├── routes.js    # HTTP 路由
-│   ├── pcap.js      # pcapng/pcap 解析器（零依赖）
-│   ├── pktmon.js    # pktmon 驱动封装
-│   └── tools.js     # 抓包流程与 id→路径解析
-├── client/client.js # 设置页面板（纯 React + 主题 token）
+│   ├── index.js         # 入口：挂路由 + 注册 agent 工具 + Config
+│   ├── routes.js        # 12 条 HTTP 路由
+│   ├── pcap.js          # pcapng/pcap 解析器（零依赖）
+│   ├── pktmon.js        # pktmon 驱动封装（非提权路径）
+│   ├── perm.js          # 环境与权限探测（pktmon / Npcap / AdminOnly）
+│   ├── elevate.js       # 一次性提权助手调用方
+│   ├── run-elevated.ps1 # 提权助手（跑完即退）
+│   └── tools.js         # 抓包流程与 id→路径解析
+├── client/client.js     # 设置页面板（纯 React + 主题 token）
 └── test/selftest.mjs
 ```
 

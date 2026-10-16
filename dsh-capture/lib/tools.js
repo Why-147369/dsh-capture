@@ -11,6 +11,8 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import { probeBackend, setFilters, clearFilters, startCapture, stopCapture, etl2pcap } from './pktmon.js';
+import { runElevatedCapture, elevationSupported } from './elevate.js';
+import { probeEnvironment } from './perm.js';
 
 /**
  * The directory every capture lives in.
@@ -110,23 +112,49 @@ export async function startCaptureFlow(opts = {}) {
   if (state.running && state.etl) {
     return { ok: false, error: '已有抓包在进行中。先调用 capture_stop 结束当前抓包。', state };
   }
-  const probe = await probeBackend();
+  // Full environment probe: it knows about pktmon *and* Npcap, so a machine
+  // where Npcap was relaxed to AdminOnly=0 is correctly seen as capturable
+  // without elevation.
+  const probe = await probeEnvironment();
+  if (!probe.isWindows) {
+    return { ok: false, error: `当前平台 ${probe.platform} 不受支持（本插件仅适配 Windows）。`, probe };
+  }
   if (!probe.pktmonExists) {
     return { ok: false, error: '本机没有 pktmon（Windows 10 1809+ / 11 自带）。无法抓包。', probe };
   }
-  if (probe.needsElevation) {
-    return {
-      ok: false,
-      error: 'pktmon 需要管理员权限，而 DSH 当前是非提权进程。可选做法：以管理员身份运行 DSH，或先用提权终端手动抓包后改用 capture_analyze 做离线分析。',
-      probe,
-    };
-  }
 
+  // Normalize the request once, before either path consumes it.
   const dir = captureDir();
   const name = safeName(opts.name);
   const filters = Array.isArray(opts.filters)
     ? opts.filters.filter((f) => f && (f.ip || Number.isFinite(Number(f.port)) || f.protocol)).slice(0, 16)
     : [];
+
+  // Non-elevated DSH cannot talk to the PktMon driver at all. Delegate just the
+  // start action to a one-shot elevated helper instead of requiring the whole
+  // app to run as administrator. The caller can opt out with {elevate:false}.
+  if (probe.pktmonNeedsElevation && opts.elevate !== false) {
+    const elevated = await startElevated(dir, name, filters, opts, probe);
+    // A declined UAC prompt is a user decision, not a failure of the plugin;
+    // report it as such so the panel can explain rather than retry.
+    if (elevated.ok || elevated.declined) return elevated;
+    // Elevation unavailable or broken: fall through and report the honest
+    // non-elevated limitation below instead of surfacing only the helper error.
+    probe.elevationError = elevated.error;
+  }
+
+  if (probe.pktmonNeedsElevation) {
+    return {
+      ok: false,
+      error: 'pktmon 需要管理员权限，而 DSH 当前是非提权进程。可选的解决方式：'
+        + '①重启 DSH 时以管理员身份运行（最简单）；'
+        + '②把 Npcap 的 AdminOnly 设为 0 后改用它（一次提权，长期免管理员）；'
+        + '③先用提权终端手动抓包，再用 capture_analyze 对本插件做离线分析。',
+      elevationError: probe.elevationError,
+      probe,
+    };
+  }
+
   const filterResult = await setFilters(filters);
   const startResult = await startCapture({
     dir,
@@ -146,6 +174,7 @@ export async function startCaptureFlow(opts = {}) {
     startedAt: Date.now(),
     name,
     filters,
+    elevated: false,
     log: [...filterResult.log, ...startResult.log].slice(-40),
   };
   writeState(next);
@@ -153,13 +182,101 @@ export async function startCaptureFlow(opts = {}) {
 }
 
 /**
+ * Start a capture through the one-shot elevated helper.
+ *
+ * The helper performs `pktmon start` with administrator rights and exits; DSH
+ * itself stays non-elevated. The ETL path is returned by the helper so the
+ * non-elevated side can still convert and parse it afterwards (`etl2pcap` and
+ * all parsing work without elevation).
+ *
+ * @param {string} dir capture directory
+ * @param {string} name sanitized capture name
+ * @param {Array<object>} filters pktmon filters
+ * @param {object} opts caller options
+ * @param {object} probe environment report (already computed by the caller)
+ * @returns {Promise<object>}
+ */
+async function startElevated(dir, name, filters, opts, probe) {
+  const job = await runElevatedCapture({
+    captureDir: dir,
+    action: 'start',
+    payload: {
+      dir,
+      name,
+      filters,
+      pktSize: Number(opts.maxPktSize) || 256,
+      maxFileMb: Number(opts.maxFileMb) || undefined,
+    },
+  });
+
+  if (!job.ok) {
+    const declined = job.declined === true;
+    return {
+      ok: false,
+      declined,
+      error: declined
+        ? '提权请求被取消（UAC），未开始抓包。若希望免去提权，可把 Npcap 的 AdminOnly 设为 0（详见 capture_probe 的说明）。'
+        : `提权抓包失败：${job.error || '未知原因'}`,
+      log: job.log,
+      probe,
+    };
+  }
+
+  const etl = job.result?.data?.etl;
+  if (!etl) {
+    return { ok: false, error: '提权助手未返回 ETL 路径。', log: job.log, probe };
+  }
+  const next = {
+    running: true,
+    etl,
+    pcapng: null,
+    startedAt: Date.now(),
+    name,
+    filters,
+    elevated: true,
+    log: [...job.log, ...(Array.isArray(job.result?.data?.filters) ? job.result.data.filters : [])].slice(-40),
+  };
+  writeState(next);
+  return {
+    ok: true,
+    state: next,
+    dir,
+    elevated: true,
+    hint: '抓包已以提权方式开始（助手已退出，DSH 仍是普通权限）。完成后调用 capture_stop。',
+  };
+}
+
+/**
  * Stop the capture, clear filters, and convert ETL to pcapng.
  * @returns {Promise<object>}
  */
-export async function stopCaptureFlow() {
+export async function stopCaptureFlow(opts = {}) {
   const state = readState();
-  const stopResult = await stopCapture();
-  const clearResult = await clearFilters();
+  let stopResult;
+  let clearResult;
+  let elevatedUsed = false;
+
+  // A capture started through the elevated helper was created by an elevated
+  // pktmon process; a non-elevated `pktmon stop` cannot reach the driver, so
+  // the stop must go back through the helper. When elevation is unavailable we
+  // still try the plain path and let the caller see the real error.
+  const needsElevatedStop = state.elevated === true && elevationSupported();
+  if (needsElevatedStop && opts.elevate !== false) {
+    const job = await runElevatedCapture({ captureDir: captureDir(), action: 'stop' });
+    elevatedUsed = job.ok;
+    if (job.ok) {
+      stopResult = { ok: true, log: job.log };
+      clearResult = { ok: true, log: [] };
+    } else {
+      stopResult = { ok: false, log: [...job.log, job.error ? `错误：${job.error}` : ''] };
+      clearResult = { ok: false, log: [] };
+    }
+  } else {
+    stopResult = await stopCapture();
+    clearResult = await clearFilters();
+  }
+
+  // Conversion and parsing need no privilege at all.
   let convert = { ok: false, out: null, size: null, log: [] };
   if (state.etl && existsSync(state.etl)) {
     convert = await etl2pcap(state.etl, state.etl.replace(/\.etl$/i, '.pcapng'));
@@ -187,6 +304,7 @@ export async function stopCaptureFlow() {
     state: next,
     capture: { ...hit },
     sizeBytes: convert.size,
+    elevatedStop: elevatedUsed,
     hint: `转换完成。用 capture_analyze 传入 id="${hit.id}" 查看流量摘要。`,
   };
 }

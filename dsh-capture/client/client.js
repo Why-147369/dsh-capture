@@ -74,6 +74,10 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false);
       const [message, setMessage] = useState(null);
       const [filters, setFilters] = useState('');
+      /** Packet rows for the selected capture: {total, offset, limit, rows}. */
+      const [packets, setPackets] = useState(null);
+      /** Currently applied packet filter, so paging keeps it. */
+      const [packetFilter, setPacketFilter] = useState({ proto: '', port: '', q: '', offset: 0, limit: 100 });
       const mountedRef = useRef(true);
 
       useEffect(() => () => { mountedRef.current = false; }, []);
@@ -116,12 +120,54 @@ window.__ModuleLoader__.load({
           body: JSON.stringify({ filters: parseFilters() }),
         });
         if (mountedRef.current) {
-          setMessage(r.ok
-            ? { kind: 'ok', text: '抓包已开始。复现目标操作后点「停止」。' }
-            : { kind: 'error', text: r.error || '启动失败' });
+          if (r.ok) {
+            setMessage({
+              kind: 'ok',
+              text: r.elevated
+                ? '抓包已以提权方式开始（助手已退出，DSH 仍为普通权限）。复现目标操作后点「停止」。'
+                : '抓包已开始。复现目标操作后点「停止」。',
+            });
+          } else if (r.declined) {
+            // UAC 被取消是用户决定，不是故障；给出可执行的下一步而不是重试提示。
+            setMessage({ kind: 'error', text: r.error || '提权请求被取消，未开始抓包。' });
+          } else {
+            setMessage({ kind: 'error', text: r.error || '启动失败' });
+          }
           setBusy(false);
         }
         refreshStatus();
+      };
+
+      /** Fetch one page of packet rows for the selected capture. */
+      const loadPackets = async (id, opts) => {
+        const o = opts || {};
+        const params = new URLSearchParams({ id, limit: String(o.limit || 100), offset: String(o.offset || 0) });
+        if (o.proto) params.set('proto', o.proto);
+        if (o.port) params.set('port', String(o.port));
+        if (o.q) params.set('q', o.q);
+        setBusy(true); setMessage(null);
+        const r = await api(`/dsh-capture/packets?${params.toString()}`);
+        if (mountedRef.current) {
+          if (r.ok) {
+            setPackets(r);
+            setPacketFilter(o);
+          } else {
+            setMessage({ kind: 'error', text: r.error || '读取包列表失败' });
+          }
+          setBusy(false);
+        }
+      };
+
+      /** Download an export through the browser. */
+      const exportCapture = (id, format) => {
+        // The route answers with a Content-Disposition attachment, so a plain
+        // navigation is enough — no blob plumbing needed.
+        const url = `/dsh-capture/export?id=${encodeURIComponent(id)}&format=${encodeURIComponent(format)}`;
+        try {
+          window.open(url, '_blank');
+        } catch {
+          setMessage({ kind: 'error', text: '无法打开下载窗口，请检查弹窗拦截设置。' });
+        }
       };
 
       const stop = async () => {
@@ -206,14 +252,24 @@ window.__ModuleLoader__.load({
           className: `dshcap-msg ${message.kind === 'error' ? 'dshcap-msg-error' : 'dshcap-msg-ok'}`,
         }, message.text) : null,
 
-        // Backend availability: explain a failure instead of showing an empty list.
+        // Environment report: explain which capture path is available and what
+        // it costs (elevation prompt vs relaxed Npcap) instead of a bare "no".
         backend ? h('div', { className: 'dshcap-card' },
           h('div', { className: 'dshcap-row' },
-            h(Cell, { label: '后端', value: backend.pktmonExists ? 'pktmon' : '缺失' }),
-            h(Cell, { label: '可运行', value: backend.canRun ? '是' : '否' }),
-            h(Cell, { label: '权限', value: backend.needsElevation ? '需管理员' : 'OK' }),
+            h(Cell, { label: 'pktmon', value: backend.pktmonExists ? (backend.pktmonUsable ? '可用' : '需提权') : '缺失' }),
+            h(Cell, { label: 'Npcap', value: backend.npcap && backend.npcap.installed ? (backend.npcap.clickableCapture ? '可抓' : '受限') : '无' }),
+            h(Cell, { label: '可抓包', value: backend.canCapture ? '是' : (backend.canCaptureWithElevation ? '需提权' : '否') }),
           ),
-          notes.length ? h('div', { className: 'dshcap-note', style: { marginTop: 6 } }, notes.join(' ')) : null,
+          h('div', { className: 'dshcap-row', style: { marginTop: 6 } },
+            h(Cell, { label: '提权途径', value: backend.elevation && backend.elevation.supported ? '可用' : '不可用' }),
+            h(Cell, { label: '平台', value: backend.platform || '?' }),
+          ),
+          notes.length
+            ? h('div', {
+                className: 'dshcap-note',
+                style: { marginTop: 6, whiteSpace: 'pre-wrap' },
+              }, notes.join('\n'))
+            : null,
         ) : null,
 
         // Start / stop.
@@ -221,9 +277,16 @@ window.__ModuleLoader__.load({
           h('div', { className: 'dshcap-row', style: { alignItems: 'center' } },
             h('button', {
               className: 'dshcap-btn dshcap-btn-primary',
-              disabled: busy || running || !(backend && backend.canRun),
+              // Enabled when a capture is possible either directly or through
+              // the one-shot elevation prompt; disabled only when neither path
+              // exists.
+              disabled: busy || running || !(backend && (backend.canCapture || backend.canCaptureWithElevation)),
+              title: running ? '已有抓包在进行中'
+                : (backend && backend.canCapture) ? '直接开始抓包'
+                  : (backend && backend.canCaptureWithElevation) ? '将弹出一次 UAC 提权请求'
+                    : '当前没有可用的抓包路径',
               onClick: start,
-            }, '开始抓包'),
+            }, (backend && !backend.canCapture && backend.canCaptureWithElevation) ? '开始抓包（需提权）' : '开始抓包'),
             h('button', { className: 'dshcap-btn', disabled: busy || !running, onClick: stop }, '停止并转换'),
           ),
           h('div', { style: { marginTop: 6 } },
@@ -306,8 +369,44 @@ window.__ModuleLoader__.load({
           ? h('div', { className: 'dshcap-note' }, `最近转换：${fmtTime(status.stoppedAt)}`)
           : null,
 
+        // Export + packet browsing for the selected capture.
+        selected && analysis ? h('div', { className: 'dshcap-card' },
+          h('div', { className: 'dshcap-row', style: { alignItems: 'center' } },
+            h('button', { className: 'dshcap-btn', disabled: busy, onClick: () => exportCapture(selected, 'csv') }, '导出 CSV'),
+            h('button', { className: 'dshcap-btn', disabled: busy, onClick: () => exportCapture(selected, 'json') }, '导出 JSON'),
+            h('button', { className: 'dshcap-btn', disabled: busy, onClick: () => loadPackets(selected, { limit: 100, offset: 0 }) }, '浏览数据包'),
+          ),
+          packets ? h('div', { style: { marginTop: 8 } },
+            h('div', { className: 'dshcap-row', style: { alignItems: 'center', marginBottom: 6 } },
+              h('span', { className: 'dshcap-meta' }, `共 ${packets.total} 个包，显示第 ${packets.offset + 1}–${Math.min(packets.offset + packets.limit, packets.total)} 个`),
+            ),
+            h('div', { className: 'dshcap-row', style: { alignItems: 'center' } },
+              h('button', {
+                className: 'dshcap-btn',
+                disabled: busy || packets.offset <= 0,
+                onClick: () => loadPackets(selected, { ...packetFilter, offset: Math.max(0, packets.offset - packets.limit) }),
+              }, '上一页'),
+              h('button', {
+                className: 'dshcap-btn',
+                disabled: busy || packets.offset + packets.limit >= packets.total,
+                onClick: () => loadPackets(selected, { ...packetFilter, offset: packets.offset + packets.limit }),
+              }, '下一页'),
+            ),
+            h('div', { className: 'dshcap-list', style: { marginTop: 6, maxHeight: 260 } },
+              (packets.rows || []).map((r) => h('div', { key: r.index, className: 'dshcap-mono' },
+                `#${r.index} ${r.proto} ${r.src || '?'}${r.sport ? ':' + r.sport : ''} → ${r.dst || '?'}${r.dport ? ':' + r.dport : ''}`
+                + ` ${r.bytes}B`
+                + (r.sni ? ` SNI=${r.sni}` : '')
+                + (r.dns ? ` DNS=${r.dns.join(',')}` : '')
+                + (r.http ? ` ${r.http}` : ''),
+              )),
+            ),
+          ) : null,
+        ) : null,
+
         h('div', { className: 'dshcap-note' },
-          '分析在本地完成，不联网。抓包需要管理员权限；无权限时仍可对已有 pcapng 做离线分析。',
+          '分析在本地完成，不联网。抓包需要管理员权限：插件会在需要时请求一次 UAC 提权（可拒绝），'
+          + '无权限时仍可对已有 pcapng 做离线分析。',
         ),
       );
     }

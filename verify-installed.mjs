@@ -111,9 +111,19 @@ async function callRoute(routePath, url, method, body) {
   if (!route) throw new Error(`路由未注册: ${routePath}`);
   const { req, res } = fakeExchange(url, method, body);
   await route.handler(req, res);
+  const raw = res.body;
+  const ctype = (res.headers && (res.headers['content-type'] || res.headers['Content-Type'])) || '';
+  // Export routes answer with text/csv, octet-stream, or a standalone JSON
+  // *document* (not the {ok:...} API envelope). Keep those as raw text so the
+  // assertion inspects the exported payload itself.
+  const isDocument = /text\/csv|application\/octet-stream/.test(ctype)
+    || (res.headers && res.headers['content-disposition']);
+  if (isDocument) {
+    return { code: res.statusCode, body: raw, contentType: ctype };
+  }
   let parsed;
-  try { parsed = JSON.parse(res.body); } catch { parsed = { raw: res.body.slice(0, 120) }; }
-  return { code: res.statusCode, body: parsed };
+  try { parsed = JSON.parse(raw); } catch { parsed = raw; }
+  return { code: res.statusCode, body: parsed, contentType: ctype };
 }
 
 try {
@@ -207,6 +217,41 @@ if (hit) {
   const fl = await callRoute('/dsh-capture/flows', `/dsh-capture/flows?id=${hit.id}&q=example`, 'GET');
   check('flows 路由支持关键词过滤', fl.code === 200 && (fl.body.sni || []).length > 0,
     `code=${fl.code} sni=${(fl.body.sni || []).length}`);
+
+  // --- packet-level browsing ---
+  const pk = await callRoute('/dsh-capture/packets', `/dsh-capture/packets?id=${hit.id}&limit=10`, 'GET');
+  check('packets 路由返回包列表（含分页字段）',
+    pk.code === 200 && Array.isArray(pk.body.rows) && typeof pk.body.total === 'number',
+    `code=${pk.code} total=${pk.body?.total} rows=${pk.body?.rows?.length}`);
+  const pkProto = await callRoute('/dsh-capture/packets', `/dsh-capture/packets?id=${hit.id}&proto=TCP`, 'GET');
+  check('packets 路由支持协议过滤',
+    pkProto.code === 200 && (pkProto.body.rows || []).every((r) => r.proto === 'TCP'),
+    `code=${pkProto.code} rows=${pkProto.body?.rows?.length}`);
+  const pkPort = await callRoute('/dsh-capture/packets', `/dsh-capture/packets?id=${hit.id}&port=443`, 'GET');
+  check('packets 路由支持端口过滤',
+    pkPort.code === 200 && (pkPort.body.rows || []).every((r) => r.sport === 443 || r.dport === 443),
+    `code=${pkPort.code} rows=${pkPort.body?.rows?.length}`);
+
+  // --- CSV export ---
+  const csv = await callRoute('/dsh-capture/export', `/dsh-capture/export?id=${hit.id}&format=csv`, 'GET');
+  check('export 路由输出 CSV（带表头与 BOM）',
+    csv.code === 200 && typeof csv.body === 'string' && csv.body.includes('index,ts,proto'),
+    `code=${csv.code} head=${String(csv.body).slice(0, 40).replace(/\n/g, '\\n')}`);
+
+  // --- JSON export ---
+  const js = await callRoute('/dsh-capture/export', `/dsh-capture/export?id=${hit.id}&format=json`, 'GET');
+  check('export 路由输出 JSON 摘要',
+    js.code === 200 && typeof js.body === 'string' && js.body.includes('"meta"'),
+    `code=${js.code} len=${String(js.body).length}`);
+
+  // --- regex search ---
+  const se = await callRoute('/dsh-capture/search', `/dsh-capture/search?id=${hit.id}&pattern=^example`, 'GET');
+  check('search 路由支持正则',
+    se.code === 200 && (se.body.sni || []).some((s) => s.name === 'example.org'),
+    `code=${se.code} sni=${JSON.stringify((se.body.sni || []).map((s) => s.name))}`);
+  const seBad = await callRoute('/dsh-capture/search', `/dsh-capture/search?id=${hit.id}&pattern=[`, 'GET');
+  check('search 路由对无效正则返回 400（不抛 500）', seBad.code === 400, `code=${seBad.code}`);
+
   const del = await callRoute('/dsh-capture/delete', '/dsh-capture/delete', 'POST', { id: hit.id });
   check('delete 路由移除测试文件', del.code === 200 && !fs.existsSync(testFile), `code=${del.code}`);
 }

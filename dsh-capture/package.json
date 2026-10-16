@@ -1,7 +1,7 @@
 {
   "name": "dsh-capture",
-  "version": "0.1.1",
-  "description": "Packet capture and traffic analysis for DeepSeek Harness: pktmon-based live capture, pcapng parsing, HTTP/DNS/TCP flow extraction, and agent tools to inspect traffic. 面向 DeepSeek Harness 的抓包与流量分析插件：基于 Windows 自带 pktmon 的实时抓包、pcapng 解析、HTTP/DNS/TCP 会话提取，并提供 agent 工具分析流量。",
+  "version": "0.2.0",
+  "description": "Packet capture and traffic analysis for DeepSeek Harness: pktmon-based live capture, one-shot elevation, pcapng parsing, HTTP/DNS/TCP flow extraction, and agent tools to inspect traffic. 面向 DeepSeek Harness 的抓包与流量分析插件：基于 Windows 自带 pktmon 的实时抓包、一次性提权、pcapng 解析、HTTP/DNS/TCP 会话提取，并提供 agent 工具分析流量。",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
@@ -14,6 +14,7 @@
     "./client": "./client/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
+    "./locale/en.json": "./locale/en.json",
     "./locale/zh.json": "./locale/zh.json"
   },
   "files": [
