@@ -34,6 +34,7 @@ const FILES = [
   'cordis.patch.yml',
   'icon.svg',
   'README.md',
+  'locale/en.json',
   'locale/zh.json',
   'lib/index.js',
   'lib/routes.js',
@@ -42,6 +43,7 @@ const FILES = [
   'lib/tools.js',
   'lib/perm.js',
   'lib/elevate.js',
+  'lib/npcap.js',
   'lib/run-elevated.ps1',
   'client/client.js',
 ];

@@ -74,6 +74,12 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false);
       const [message, setMessage] = useState(null);
       const [filters, setFilters] = useState('');
+      /** Raw BPF override for the Npcap backend (empty = derive from filters). */
+      const [bpf, setBpf] = useState('');
+      /** Chosen adapter device name; empty = let the host pick the default. */
+      const [device, setDevice] = useState('');
+      const [interfaces, setInterfaces] = useState([]);
+      const [showAdvanced, setShowAdvanced] = useState(false);
       /** Packet rows for the selected capture: {total, offset, limit, rows}. */
       const [packets, setPackets] = useState(null);
       /** Currently applied packet filter, so paging keeps it. */
@@ -95,12 +101,27 @@ window.__ModuleLoader__.load({
         if (s.ok) setCaptures(Array.isArray(s.captures) ? s.captures : []);
       }, []);
 
+      /** Load the adapter list. `refresh` may cost one Npcap confirmation. */
+      const loadInterfaces = useCallback(async (refresh) => {
+        const s = await api(`/dsh-capture/interfaces${refresh ? '?refresh=1' : ''}`);
+        if (!mountedRef.current) return;
+        if (s.ok) {
+          setInterfaces(Array.isArray(s.interfaces) ? s.interfaces : []);
+          // Keep the user's choice if it still exists; otherwise show the
+          // host's default so the picker is never blank.
+          if (s.default && !device) setDevice('');
+        } else if (s.error) {
+          setMessage({ kind: 'error', text: s.error });
+        }
+      }, [device]);
+
       useEffect(() => {
         refreshStatus();
         refreshList();
+        loadInterfaces(false);
         const timer = setInterval(() => { refreshStatus(); refreshList(); }, 5000);
         return () => clearInterval(timer);
-      }, [refreshStatus, refreshList]);
+      }, [refreshStatus, refreshList, loadInterfaces]);
 
       /** Parse the filter textarea into pktmon filter objects. */
       const parseFilters = () => {
@@ -115,20 +136,23 @@ window.__ModuleLoader__.load({
 
       const start = async () => {
         setBusy(true); setMessage(null);
+        const body = { filters: parseFilters() };
+        if (bpf.trim()) body.bpf = bpf.trim();
+        if (device) body.device = device;
         const r = await api('/dsh-capture/start', {
           method: 'POST',
-          body: JSON.stringify({ filters: parseFilters() }),
+          body: JSON.stringify(body),
         });
         if (mountedRef.current) {
           if (r.ok) {
-            setMessage({
-              kind: 'ok',
-              text: r.elevated
-                ? '抓包已以提权方式开始（助手已退出，DSH 仍为普通权限）。复现目标操作后点「停止」。'
-                : '抓包已开始。复现目标操作后点「停止」。',
-            });
+            const bits = [`抓包已开始（${r.backend || '?'}）`];
+            if (r.ifaceLabel) bits.push(`网卡：${r.ifaceLabel}`);
+            if (r.bpf) bits.push(`BPF：${r.bpf}`);
+            if (r.elevated) bits.push('经提权助手启动，助手已退出');
+            if (r.note) bits.push(r.note);
+            bits.push('复现目标操作后点「停止」。');
+            setMessage({ kind: 'ok', text: bits.join('\n') });
           } else if (r.declined) {
-            // UAC 被取消是用户决定，不是故障；给出可执行的下一步而不是重试提示。
             setMessage({ kind: 'error', text: r.error || '提权请求被取消，未开始抓包。' });
           } else {
             setMessage({ kind: 'error', text: r.error || '启动失败' });
@@ -222,6 +246,10 @@ window.__ModuleLoader__.load({
           .dshcap-btn:disabled { opacity:.45; cursor:default; }
           .dshcap-btn-primary { border-color:var(--dsw-alias-brand-primary,#247bbf); color:var(--dsw-alias-brand-primary,#247bbf); }
           .dshcap-input { width:100%; box-sizing:border-box; background:var(--dsw-alias-bg-primary,transparent); color:inherit; border:1px solid var(--dsw-alias-border-secondary,rgba(255,255,255,.18)); border-radius:6px; padding:4px 6px; font-size:12px; font-family:inherit; }
+          /* A <select> needs the host page background so the native dropdown
+             popup does not render as an unreadable system default. */
+          select.dshcap-input { background:var(--dsw-alias-bg-secondary,#222); appearance:auto; }
+          select.dshcap-input option { background:var(--dsw-alias-bg-secondary,#222); color:inherit; }
           .dshcap-note { opacity:.7; font-size:11px; line-height:1.5; }
           .dshcap-msg { border-radius:6px; padding:6px 8px; font-size:11px; line-height:1.5; }
           .dshcap-msg-ok { background:var(--dsw-alias-bg-tertiary,rgba(255,255,255,.06)); }
@@ -252,16 +280,16 @@ window.__ModuleLoader__.load({
           className: `dshcap-msg ${message.kind === 'error' ? 'dshcap-msg-error' : 'dshcap-msg-ok'}`,
         }, message.text) : null,
 
-        // Environment report: explain which capture path is available and what
-        // it costs (elevation prompt vs relaxed Npcap) instead of a bare "no".
+        // Environment report: which backend was chosen and what it costs.
         backend ? h('div', { className: 'dshcap-card' },
           h('div', { className: 'dshcap-row' },
-            h(Cell, { label: 'pktmon', value: backend.pktmonExists ? (backend.pktmonUsable ? '可用' : '需提权') : '缺失' }),
-            h(Cell, { label: 'Npcap', value: backend.npcap && backend.npcap.installed ? (backend.npcap.clickableCapture ? '可抓' : '受限') : '无' }),
-            h(Cell, { label: '可抓包', value: backend.canCapture ? '是' : (backend.canCaptureWithElevation ? '需提权' : '否') }),
+            h(Cell, { label: '后端', value: backend.backend === 'npcap' ? 'Npcap' : backend.backend === 'pktmon' ? 'pktmon' : '不可用' }),
+            h(Cell, { label: '可抓包', value: backend.canCapture ? '是' : '否' }),
+            h(Cell, { label: '提权', value: backend.needsElevation ? '需' : '不需要' }),
           ),
           h('div', { className: 'dshcap-row', style: { marginTop: 6 } },
-            h(Cell, { label: '提权途径', value: backend.elevation && backend.elevation.supported ? '可用' : '不可用' }),
+            h(Cell, { label: '网卡数', value: (backend.interfaces || []).length }),
+            h(Cell, { label: '默认网卡', value: backend.defaultInterface ? backend.defaultInterface.label : '—' }),
             h(Cell, { label: '平台', value: backend.platform || '?' }),
           ),
           notes.length
@@ -277,16 +305,15 @@ window.__ModuleLoader__.load({
           h('div', { className: 'dshcap-row', style: { alignItems: 'center' } },
             h('button', {
               className: 'dshcap-btn dshcap-btn-primary',
-              // Enabled when a capture is possible either directly or through
-              // the one-shot elevation prompt; disabled only when neither path
-              // exists.
-              disabled: busy || running || !(backend && (backend.canCapture || backend.canCaptureWithElevation)),
+              // Enabled whenever a backend is available; the pktmon path may
+              // raise one UAC prompt, the Npcap path none.
+              disabled: busy || running || !(backend && backend.canCapture),
               title: running ? '已有抓包在进行中'
-                : (backend && backend.canCapture) ? '直接开始抓包'
-                  : (backend && backend.canCaptureWithElevation) ? '将弹出一次 UAC 提权请求'
-                    : '当前没有可用的抓包路径',
+                : (backend && backend.needsElevation) ? '将弹出一次 UAC 提权请求'
+                  : (backend && backend.canCapture) ? '直接开始抓包'
+                    : '当前没有可用的抓包后端',
               onClick: start,
-            }, (backend && !backend.canCapture && backend.canCaptureWithElevation) ? '开始抓包（需提权）' : '开始抓包'),
+            }, (backend && backend.needsElevation) ? '开始抓包（需提权）' : '开始抓包'),
             h('button', { className: 'dshcap-btn', disabled: busy || !running, onClick: stop }, '停止并转换'),
           ),
           h('div', { style: { marginTop: 6 } },
@@ -297,8 +324,42 @@ window.__ModuleLoader__.load({
               onChange: (e) => setFilters(e.target.value),
             }),
           ),
-          running && status && status.etl
-            ? h('div', { className: 'dshcap-mono', style: { marginTop: 6 } }, `正在写入 ${status.etl}`)
+          // Backend-specific controls. Npcap capture can target a specific
+          // adapter and take a raw BPF expression; showing them only when that
+          // backend is active avoids offering options that would be ignored.
+          backend && backend.backend === 'npcap' ? h('div', { style: { marginTop: 6 } },
+            h('select', {
+              className: 'dshcap-input',
+              value: device,
+              onChange: (e) => setDevice(e.target.value),
+            },
+              h('option', { value: '' }, `自动选择（${backend.defaultInterface ? backend.defaultInterface.label : '默认'}）`),
+              (interfaces.length ? interfaces : (backend.interfaces || []))
+                .filter((i) => i.kind !== 'virtual' && i.kind !== 'loopback')
+                .map((i) => h('option', { key: i.device, value: i.device }, `${i.label} [${i.kind}]`)),
+              (interfaces.length ? interfaces : (backend.interfaces || []))
+                .filter((i) => i.kind === 'virtual' || i.kind === 'loopback')
+                .map((i) => h('option', { key: i.device, value: i.device }, `${i.label} [${i.kind}]`)),
+            ),
+            h('div', { className: 'dshcap-row', style: { marginTop: 4, alignItems: 'center' } },
+              h('button', { className: 'dshcap-btn', disabled: busy, onClick: () => loadInterfaces(true) }, '刷新网卡'),
+              h('button', { className: 'dshcap-btn', disabled: busy, onClick: () => setShowAdvanced(!showAdvanced) },
+                showAdvanced ? '收起高级' : '高级'),
+            ),
+            showAdvanced ? h('input', {
+              className: 'dshcap-input',
+              style: { marginTop: 4 },
+              placeholder: 'BPF 表达式，例如 tcp port 443（留空则由上面的过滤推导）',
+              value: bpf,
+              onChange: (e) => setBpf(e.target.value),
+            }) : null,
+            h('div', { className: 'dshcap-note', style: { marginTop: 4 } },
+              '首次打开网卡时 Npcap 可能弹一次确认框。',
+            ),
+          ) : null,
+          running && status
+            ? h('div', { className: 'dshcap-mono', style: { marginTop: 6 } },
+                `正在写入 ${status.file || status.etl || ''}`)
             : null,
         ),
 

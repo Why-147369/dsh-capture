@@ -22,6 +22,8 @@ const PROFILE = fromArg
     || path.join(process.env.DSH_HOME || path.join(process.env.USERPROFILE || '', '.dsh'), 'profiles', 'desktop'));
 const INST = path.join(PROFILE, 'node_modules', 'dsh-capture');
 const HOME = process.env.DSH_HOME || path.join(process.env.USERPROFILE || '', '.dsh');
+/** Capture directory, declared early: several checks below use it. */
+const captureDir = path.join(HOME, 'dsh-capture');
 
 /** Windows 绝对路径必须转成 file:// URL 才能被 ESM loader 接受。 */
 const asUrl = (p) => pathToFileURL(p).href;
@@ -55,7 +57,10 @@ try {
 }
 
 const { mountRoutes } = await import(asUrl(path.join(INST, 'lib', 'routes.js')));
-const { probeBackend } = await import(asUrl(path.join(INST, 'lib', 'pktmon.js')));
+const { probeEnvironment, backendLabel } = await import(asUrl(path.join(INST, 'lib', 'perm.js')));
+const npcap = await import(asUrl(path.join(INST, 'lib', 'npcap.js')));
+const toolsMod = await import(asUrl(path.join(INST, 'lib', 'tools.js')));
+const pcapMod = await import(asUrl(path.join(INST, 'lib', 'pcap.js')));
 
 // ---- 2) 假 webServer，抓取注册的路由 ----
 const registered = new Map();
@@ -79,14 +84,72 @@ try {
   check('mountRoutes 注册成功（无重复路径）', false, String(e.message));
 }
 
-// ---- 3) 后端探测 ----
-const probe = await probeBackend();
-check('probeBackend 返回结构完整',
-  typeof probe.pktmonExists === 'boolean' && Array.isArray(probe.notes),
-  `pktmonExists=${probe.pktmonExists} canRun=${probe.canRun} needsElevation=${probe.needsElevation}`);
-check('能识别出权限状态（可用 / 需提权 / 无组件）',
-  probe.canRun || probe.needsElevation || !probe.pktmonExists,
-  (probe.notes && probe.notes[0]) || '');
+// ---- 3) 后端选择与环境探测 ----
+const env = await probeEnvironment();
+check('probeEnvironment 返回结构完整',
+  typeof env.canCapture === 'boolean' && Array.isArray(env.notes) && 'backend' in env,
+  `backend=${env.backend} canCapture=${env.canCapture} needsElevation=${env.needsElevation}`);
+check('backendLabel 可用', typeof backendLabel(env) === 'string', backendLabel(env));
+check('平台判定为 Windows', env.isWindows === true, `platform=${env.platform}`);
+check('能识别出可用的抓包后端（或说明为何不可用）',
+  env.canCapture || env.notes.length > 0,
+  env.canCapture ? `后端 ${env.backend}` : (env.notes[0] || ''));
+
+// Npcap 若存在，接口分类必须正确（虚拟网卡不得被标为推荐）
+if (env.npcap && env.npcap.available) {
+  const real = env.interfaces.filter((i) => i.recommended);
+  const virtAsReal = env.interfaces.filter((i) => i.recommended && (i.kind === 'virtual' || i.kind === 'loopback'));
+  check('Npcap 接口分类正确（虚拟/环回不得标为推荐）', virtAsReal.length === 0,
+    `${env.interfaces.length} 个网卡，推荐 ${real.length} 个，误标 ${virtAsReal.length} 个`);
+  check('Npcap 能选出默认网卡', !!env.defaultInterface,
+    env.defaultInterface ? `${env.defaultInterface.label} [${env.defaultInterface.kind}]` : '未选出');
+  // 设备名必须是 \Device\NPF_{...} 形式，绝不用数字索引
+  if (env.defaultInterface) {
+    check('默认网卡使用设备名而非索引',
+      env.defaultInterface.device.startsWith('\\Device\\NPF_'),
+      env.defaultInterface.device);
+  }
+}
+
+// ---- 3b) 结构化过滤器 → BPF 转换 ----
+{
+  const cases = [
+    { in: [{ port: 443 }], want: 'port 443' },
+    { in: [{ protocol: 'TCP' }], want: 'tcp' },
+    { in: [{ ip: '1.1.1.1', port: 53 }], want: 'host 1.1.1.1 and port 53' },
+    { in: [], want: '' },
+  ];
+  let bad = 0;
+  for (const c of cases) {
+    const got = toolsMod.filtersToBpf(c.in);
+    if (c.want === '') { if (got !== '') bad++; }
+    else if (!got.includes(c.want)) bad++;
+  }
+  check('filtersToBpf 转换正确', bad === 0, `${cases.length} 个用例，${bad} 个不符`);
+  const multi = toolsMod.filtersToBpf([{ port: 80 }, { port: 443 }]);
+  check('filtersToBpf 多条件用 or 连接', /or/.test(multi), multi);
+}
+
+// ---- 3c) 抓包成功判据：必须数 EPB 块，不能看文件大小 ----
+{
+  // 构造一个"合法但零包"的 pcapng（SHB+IDB+ISB），大小 > 24 字节
+  const shbBody = Buffer.alloc(16);
+  shbBody.writeUInt32LE(0x1a2b3c4d, 0);
+  shbBody.writeUInt16LE(1, 4);
+  const shb = Buffer.concat([Buffer.from([0x0a, 0x0d, 0x0d, 0x0a]), Buffer.from([0, 0, 0, 0]), shbBody]);
+  const pad = (4 - (shb.length % 4)) % 4;
+  const total = shb.length + pad + 4;
+  const lenBuf = Buffer.alloc(4); lenBuf.writeUInt32LE(total, 0);
+  const shbOut = Buffer.concat([shb, Buffer.alloc(pad), lenBuf]);
+  shbOut.writeUInt32LE(total, 4);
+  const emptyFile = path.join(captureDir, 'verify-empty.pcapng');
+  fs.writeFileSync(emptyFile, shbOut);
+  const st = npcap.countPacketBlocks(emptyFile);
+  check('countPacketBlocks 识别零包文件',
+    st.packets === 0 && st.bytes > 24,
+    `bytes=${st.bytes} packets=${st.packets}（体积大但零包，必须判 0）`);
+  fs.rmSync(emptyFile, { force: true });
+}
 
 // ---- 4) 真正调用路由 handler ----
 function fakeExchange(url, method = 'GET', body = null) {
@@ -200,10 +263,8 @@ function buildPcapngWithOneHttps(sniHost) {
   return Buffer.concat([shbOut, hdr, frame, Buffer.alloc(fpad), flen]);
 }
 
-const captureDir = path.join(HOME, 'dsh-capture');
 fs.mkdirSync(captureDir, { recursive: true });
-const testFile = path.join(captureDir, 'verify-e2e.pcapng');
-fs.writeFileSync(testFile, buildPcapngWithOneHttps('example.org'));
+const testFile = path.join(captureDir, 'verify-e2e.pcapng');fs.writeFileSync(testFile, buildPcapngWithOneHttps('example.org'));
 say(`       写入测试抓包 ${testFile} (${fs.statSync(testFile).size} B)`);
 
 const sess = await callRoute('/dsh-capture/sessions', '/dsh-capture/sessions', 'GET');

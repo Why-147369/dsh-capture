@@ -5,6 +5,78 @@
 > **状态说明**：本插件**未开发完成**，处于**测试阶段**。在 1.0.0 之前，
 > API、配置项与文件格式均可能在不通知的情况下变更。
 
+## [0.3.0] — 2026-10-16
+
+本版本接入 Npcap 后端，**并更正了 0.1.0 起一直存在的错误结论**：「抓包需要管理员权限」。
+
+### ⚠️ 重要更正：抓包不需要管理员权限
+
+0.1.0/0.2.0 的文档、README 与 CHANGELOG 都写着「抓包需要管理员权限」。
+**这是错的** —— 该结论只探测了 `pktmon` 就推广到全部路径。
+
+实测事实：
+
+| 路径 | 需要管理员？ | 证据 |
+|---|---|---|
+| **Npcap / dumpcap** | **不需要** | `dumpcap.exe` manifest 为 `asInvoker`；非提权连续三轮抓到 164 / 100 / 83 个包 |
+| pktmon | 需要 | `PktMon` 是内核驱动，`pktmon filter list` 无提权返回 exit 5 |
+
+另外，Npcap 的 `AdminOnly=1` **并不阻止**非提权抓包 —— 它只在进程首次打开适配器时
+触发一次 `NpcapHelper` 确认框（不是 UAC）。此前把该确认框误判为提权需求。
+
+### 新增
+- **`lib/npcap.js`：Npcap/dumpcap 后端**（首选）
+  - 从注册表 `HKLM\SOFTWARE\WOW6432Node\Wireshark\InstallDir` 定位安装目录（支持非默认路径），并以常见路径兜底
+  - **按设备名 `\Device\NPF_{GUID}` 寻址**，绝不用数字索引（索引会在虚拟网卡间漂移，导致静默抓到空网卡）
+  - 网卡分类 `wifi`/`ethernet`/`virtual`/`loopback`，默认优选真实网卡
+  - 网卡列表 **5 分钟缓存**，避免同一会话反复触发 Npcap 确认框
+  - 支持 `-f` **BPF 表达式**、`-s` snaplen、`-b` 环形缓冲、`-a` 定时停止
+  - 停止用 `taskkill /F /PID <pid> /T`：dumpcap 逐块落盘，强杀后文件仍完整（实测 42 包零丢失）
+- **`lib/perm.js` 重写**：后端选择改为 Npcap 优先 → pktmon（+提权助手）→ 不可用，并给出可执行的说明
+- **抓包成败判据改为数 EPB 数据块**（`0x00000006` / `0x00000003`）：
+  文件体积不可靠 —— 一个 484 字节的 pcapng 完全合法却零包
+- `GET /interfaces` 路由：网卡清单，`?refresh=1` 强制重枚举
+- `GET /status` 增加 `live` 字段：抓包中可读实时包数
+- `capture_start` 新增 `device` / `bpf` / `snaplen` / `durationSec` / `ringFileMb` 参数
+- `capture_list` 返回每个抓包的**包数**
+- `capture_probe` 报告选定后端、网卡清单与默认网卡
+- 结构化 `filters` → BPF 表达式转换（多条件用 `or` 连接）
+- 面板：网卡选择器（含「刷新网卡」）、BPF 高级输入、后端状态卡、抓包中提示
+- `test/pcapng-idb.test.mjs`：pcapng IDB 回归测试
+
+### 修复
+- **解析器严重 bug：所有真实 pcapng 的包全被丢弃**
+  `parsePcapng` 从 **SHB 块偏移 20** 读 `linkType`，但 SHB 根本没有该字段
+  （布局为 `type/len/byte-order-magic/version/section-length/options`），
+  于是读进 options 区得到 `0xFFFFFFFF`，导致 `unsupportedLink` 计满、包数为 0。
+  **正确位置是 IDB 偏移 8、2 字节。**
+  此前未被发现是因为合成测试文件的 IDB 是简化版（16 字节无 options），
+  恰好绕过了错误偏移；真实 dumpcap 产出的 IDB 带 192 字节选项区才暴露出来。
+  修复后真实抓包解析恢复正常（164 / 100 / 83 包，SNI 与 DNS 均正确）。
+- `routes.js` 中 `mountRoutes(ctx, config)` 内部引用了未定义的 `cfg`，导致 `/start`
+  抛 `cfg is not defined`。已改为在函数入口归一化配置。
+- `/download` 路由现在遵守 `allowDownload: false` 配置。
+- `lib/tools.js` 整文件重写为后端无关的流程层（原先硬编码 pktmon 的 ETL 流程）。
+
+### 变更
+- `lib/perm.js`、`lib/tools.js` 重写；`lib/index.js`、`lib/routes.js`、`client/client.js` 调整
+- 路由 12 → **13** 条
+- 装机验证 21 → **29** 项
+- `version` 0.2.0 → 0.3.0
+
+### 新增验证
+- **端到端真实抓包 9 项全过**：`/status` 选后端 → `/interfaces` → `/start` 真实抓包 →
+  抓包中实时包数 → `/stop` 零丢包 → `/analyze` 解析出 SNI/DNS → `/export` CSV 行数与包数一致 →
+  BPF 过滤生效（156 包违规 0）
+
+### 已知问题（未修复）
+- **pktmon + 提权助手路径未在真机验证**：本机有 Npcap，后端自动选它，
+  因此 UAC 全链与拒绝分支均未跑通
+- TCP 流重组、HTTP 报文体重组、TLS 握手版本/密码套件均未实现
+- 大文件未流式解析（整文件读入，默认上限 96 MB）
+- 抓包文件无自动清理（Npcap 后端可用 `ringFileMb` 回绕，旧文件需手动删）
+- 仅 Windows
+
 ## [0.2.0] — 2026-10-16
 
 本版本主要解决「抓包必须让整个 DSH 以管理员运行」这个实际痛点，并补齐

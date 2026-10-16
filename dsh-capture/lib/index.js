@@ -157,7 +157,7 @@ function registerTools(ctx, cfg) {
   add({
     name: 'capture_probe',
     description:
-      '检查本机抓包能力：pktmon 是否可用、是否缺管理员权限、Npcap 安装与 AdminOnly 设置、可用的提权途径。在 capture_start 之前调用一次；抓包失败时也用它解释原因。',
+      '检查本机抓包能力并报告选定的后端：Npcap（Wireshark/dumpcap，免管理员）或 pktmon（需提权）。同时列出可用网卡。在 capture_start 之前调用一次；抓包失败时也用它解释原因。',
     parameters: {},
     output: {
       schema: {
@@ -169,15 +169,24 @@ function registerTools(ctx, cfg) {
       render: (_args, value) => {
         const lines = [];
         const flag = (b) => (b ? '是' : '否');
-        lines.push(`平台: ${value.platform} | 可抓包: ${flag(value.canCapture)} | 需提权才可抓: ${flag(value.canCaptureWithElevation)}`);
-        lines.push(`pktmon: 存在=${flag(value.pktmonExists)} 可用=${flag(value.pktmonUsable)} 需提权=${flag(value.pktmonNeedsElevation)}`);
+        lines.push(`平台: ${value.platform} | 后端: ${value.backend || '不可用'} | 可抓包: ${flag(value.canCapture)}${value.needsElevation ? '（需提权）' : ''}`);
         if (value.npcap) {
-          lines.push(`Npcap: 已装=${flag(value.npcap.installed)} 驱动运行=${flag(value.npcap.driverRunning)} AdminOnly=${value.npcap.adminOnly ?? '未知'} 可非提权抓包=${flag(value.npcap.clickableCapture)}`);
+          lines.push(`Npcap: 可用=${flag(value.npcap.available)} 目录=${value.npcap.dir || '—'} 网卡数=${value.npcap.interfaceCount}`);
+          if (value.npcapConfig && value.npcapConfig.adminOnly !== null) {
+            lines.push(`  AdminOnly=${value.npcapConfig.adminOnly}（实测不阻止非提权抓包，仅可能弹一次确认框）`);
+          }
         }
-        if (value.cli && (value.cli.tshark || value.cli.dumpcap)) {
-          lines.push(`外部工具: tshark=${value.cli.tshark || '无'} dumpcap=${value.cli.dumpcap || '无'}`);
+        if (value.pktmon) {
+          lines.push(`pktmon: 存在=${flag(value.pktmon.exists)} 可用=${flag(value.pktmon.usable)} 需提权=${flag(value.pktmon.needsElevation)}`);
         }
-        if (value.elevation) lines.push(`提权途径: 支持=${flag(value.elevation.supported)} (${value.elevation.mechanism})`);
+        if (value.defaultInterface) {
+          lines.push(`默认网卡: ${value.defaultInterface.label}（${value.defaultInterface.kind}）`);
+        }
+        if (Array.isArray(value.interfaces) && value.interfaces.length) {
+          const real = value.interfaces.filter((i) => i.recommended);
+          lines.push(`可选网卡（${value.interfaces.length} 个，推荐 ${real.length} 个）:`);
+          for (const i of real) lines.push(`  - ${i.label} [${i.kind}] ${i.device}`);
+        }
         lines.push(`目录: ${value.dir ?? ''}`);
         if (Array.isArray(value.notes) && value.notes.length) {
           lines.push('');
@@ -187,8 +196,8 @@ function registerTools(ctx, cfg) {
       },
     },
     execute: async () => {
-      const backend = await probeEnvironment();
-      return { ...backend, ok: true, dir: captureDir() };
+      const env = await probeEnvironment();
+      return { ...env, ok: true, dir: captureDir() };
     },
   });
 
@@ -220,15 +229,23 @@ function registerTools(ctx, cfg) {
   add({
     name: 'capture_start',
     description:
-      '用 Windows 自带 pktmon 开始实时抓包。可用 filters 限定范围以缩小文件（最多 16 条）。多数环境需要管理员权限；失败原因由 capture_probe 解释。开始后必须调用 capture_stop 结束并转换文件。',
+      '开始抓包。自动选用后端：Npcap（dumpcap，免管理员）优先，其次 pktmon（会弹一次 UAC 提权助手）。可用 filters（结构化）或 bpf（原始 libpcap 表达式）限定范围。开始后必须调用 capture_stop 结束。',
     parameters: {
       name: {
         type: 'string',
         description: '文件名主干，仅允许字母数字与 ._-，最长 48 字符。省略则自动生成。',
       },
+      device: {
+        type: 'string',
+        description: 'Npcap 后端下指定网卡设备名（形如 \\Device\\NPF_{GUID}，来自 capture_probe 的可选网卡列表）。省略则自动选择 WLAN/以太网。',
+      },
+      bpf: {
+        type: 'string',
+        description: 'Npcap 后端的 libpcap 抓包过滤器，例如 "tcp port 443"、"host 1.1.1.1"。与 filters 二选一，优先使用本项。',
+      },
       filters: {
         type: 'array',
-        description: 'pktmon 过滤规则，例如 [{"ip":"1.1.1.1"},{"port":443},{"protocol":"TCP"}]。留空抓全部流量（文件会很大）。',
+        description: '结构化过滤条件，例如 [{"ip":"1.1.1.1"},{"port":443},{"protocol":"TCP"}]。Npcap 下会转换成等价的 BPF，pktmon 下直接作为筛选器。留空抓全部流量。',
         items: {
           type: 'object',
           additionalProperties: false,
@@ -239,13 +256,25 @@ function registerTools(ctx, cfg) {
           },
         },
       },
+      snaplen: {
+        type: 'integer',
+        description: 'Npcap 后端：每包截取字节数 64..262144，默认 262144（完整包）。只看首部时可调小。',
+      },
+      durationSec: {
+        type: 'integer',
+        description: 'Npcap 后端：自动停止秒数。省略则手动停止。',
+      },
+      ringFileMb: {
+        type: 'integer',
+        description: 'Npcap 后端：单文件大小上限（MB），超出后回绕，避免长抓包撑爆磁盘。',
+      },
       maxPktSize: {
         type: 'integer',
-        description: '每包截取字节数 64..262144，默认 256。只关心首部与握手时可用更小值。',
+        description: 'pktmon 后端：每包截取字节数 64..262144，默认 256。',
       },
       maxFileMb: {
         type: 'integer',
-        description: '可选的文件体积上限（MB），到达后 pktmon 会复用文件。',
+        description: 'pktmon 后端：文件体积上限（MB）。',
       },
     },
     output: {
@@ -258,13 +287,22 @@ function registerTools(ctx, cfg) {
       render: (_args, value) => [{
         type: 'text',
         text: value.ok
-          ? `抓包已开始：${value.state?.etl ?? ''}\n${value.hint ?? ''}`
-          : `启动失败：${value.error ?? '未知错误'}`,
+          ? `抓包已开始 [${value.backend}]`
+            + (value.ifaceLabel ? `\n网卡: ${value.ifaceLabel}` : '')
+            + (value.bpf ? `\nBPF: ${value.bpf}` : '')
+            + (value.note ? `\n${value.note}` : '')
+            + (value.hint ? `\n${value.hint}` : '')
+          : `启动失败${value.declined ? '（提权被取消）' : ''}：${value.error ?? '未知错误'}`,
       }],
     },
     execute: async (args) => startCaptureFlow({
       name: args?.name,
+      device: args?.device,
+      bpf: args?.bpf,
       filters: Array.isArray(args?.filters) ? args.filters : [],
+      snaplen: Number(args?.snaplen) || undefined,
+      durationSec: Number(args?.durationSec) || undefined,
+      ringFileMb: Number(args?.ringFileMb) || undefined,
       maxPktSize: Number(args?.maxPktSize) || cfg.defaultPktSize,
       maxFileMb: Number(args?.maxFileMb) || undefined,
       // Config can forbid UAC prompts entirely for unattended setups.

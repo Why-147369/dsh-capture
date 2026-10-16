@@ -22,7 +22,8 @@ import { basename, join } from 'node:path';
 import { parseCapture, DNS_TYPES } from './pcap.js';
 import { status } from './pktmon.js';
 import { probeEnvironment } from './perm.js';
-import { startCaptureFlow, stopCaptureFlow } from './tools.js';
+import { listInterfaces, pickDefaultInterface, invalidateInterfaceCache } from './npcap.js';
+import { startCaptureFlow, stopCaptureFlow, liveStatus } from './tools.js';
 
 /** Read at most this many bytes into memory when analyzing a capture. */
 const MAX_ANALYZE_BYTES = 96 * 1024 * 1024;
@@ -188,6 +189,13 @@ function analyzeFile(full) {
  * @returns {() => void} disposer
  */
 export function mountRoutes(ctx, config) {
+  // Normalize once so the route handlers can read plain values regardless of
+  // whether the caller passed a schemastery object, a plain object, or nothing.
+  const cfg = {
+    defaultPktSize: Number(config?.defaultPktSize) > 0 ? Number(config.defaultPktSize) : 256,
+    useElevation: config?.useElevation !== false,
+    allowDownload: config?.allowDownload !== false,
+  };
   const disposers = [];
   const dir = captureDir();
   mkdirSync(dir, { recursive: true });
@@ -196,10 +204,31 @@ export function mountRoutes(ctx, config) {
   // Each entry therefore declares one path plus the methods it accepts, and
   // the handler enforces the method itself.
   const routes = [
-    ['/dsh-capture/status', ['GET'], guard(async (_req, res) => {
-      const backend = await probeEnvironment();
+    ['/dsh-capture/status', ['GET'], guard(async (req, res) => {
+      const url = new URL(req.url, 'http://127.0.0.1');
+      // Re-enumerating adapters can cost one Npcap confirmation prompt, so it
+      // is opt-in via ?refresh=1 rather than done on every poll.
+      const refresh = url.searchParams.get('refresh') === '1';
+      const backend = await probeEnvironment({ refreshInterfaces: refresh });
       const state = readState();
-      json(res, 200, { ok: true, backend, state, dir });
+      const live = liveStatus();
+      json(res, 200, { ok: true, backend, state, live, dir });
+    })],
+
+    // Adapter inventory for the panel's picker. `?refresh=1` forces a fresh
+    // enumeration (may prompt once on Npcap).
+    ['/dsh-capture/interfaces', ['GET'], guard(async (req, res) => {
+      const url = new URL(req.url, 'http://127.0.0.1');
+      const refresh = url.searchParams.get('refresh') === '1';
+      if (refresh) invalidateInterfaceCache();
+      const li = await listInterfaces({ refresh });
+      json(res, 200, {
+        ok: li.ok,
+        cached: li.cached === true,
+        interfaces: li.interfaces || [],
+        default: pickDefaultInterface(li.interfaces || []),
+        error: li.error,
+      });
     })],
 
     ['/dsh-capture/sessions', ['GET'], guard(async (_req, res) => {
@@ -213,6 +242,13 @@ export function mountRoutes(ctx, config) {
       const result = await startCaptureFlow({
         name: body.name,
         filters: Array.isArray(body.filters) ? body.filters : [],
+        // Npcap-specific options; ignored by the pktmon backend.
+        device: typeof body.device === 'string' ? body.device : undefined,
+        bpf: typeof body.bpf === 'string' ? body.bpf : undefined,
+        snaplen: Number(body.snaplen) || undefined,
+        ringFileMb: Number(body.ringFileMb) || undefined,
+        durationSec: Number(body.durationSec) || undefined,
+        // pktmon-specific options.
         maxPktSize: Number(body.maxPktSize) || cfg.defaultPktSize,
         maxFileMb: Number(body.maxFileMb) || undefined,
         elevate: cfg.useElevation !== false,
@@ -227,7 +263,17 @@ export function mountRoutes(ctx, config) {
         });
         return;
       }
-      json(res, 200, { ok: true, state: result.state, elevated: result.elevated === true, hint: result.hint });
+      json(res, 200, {
+        ok: true,
+        state: result.state,
+        backend: result.backend,
+        elevated: result.elevated === true,
+        device: result.device,
+        ifaceLabel: result.ifaceLabel,
+        bpf: result.bpf,
+        note: result.note,
+        hint: result.hint,
+      });
     })],
 
     ['/dsh-capture/stop', ['POST'], guard(async (_req, res) => {
@@ -272,6 +318,10 @@ export function mountRoutes(ctx, config) {
     })],
 
     ['/dsh-capture/download', ['GET'], guard(async (req, res) => {
+      if (!cfg.allowDownload) {
+        json(res, 403, { ok: false, error: '配置已禁用抓包文件下载（allowDownload: false）。可直接从磁盘复制。', dir });
+        return;
+      }
       const url = new URL(req.url, 'http://127.0.0.1');
       const full = resolveId(url.searchParams.get('id') || '');
       if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件。' }); return; }

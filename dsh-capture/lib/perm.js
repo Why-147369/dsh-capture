@@ -1,42 +1,40 @@
 /**
- * dsh-capture: capture capability and permission detection.
+ * dsh-capture: capture backend selection and environment reporting.
  *
- * Windows offers two packet-capture paths, and both are gated by the kernel:
+ * Windows offers two capture paths with very different privilege stories.
+ * This module picks one and explains the choice, so the panel and the agent
+ * tools never have to guess why a capture failed.
  *
- *   pktmon   — built into Windows 10 1809+ / 11. `PktMon` is a KERNEL_DRIVER
- *              whose device object is Administrators-only, so even the
- *              read-only `pktmon filter list` returns exit 5 ("cannot
- *              communicate with the PktMon driver; access denied") without
- *              elevation.
- *   Npcap    — a third-party driver. When installed with "Restrict Npcap
- *              driver's access to Administrators only" (the installer's
- *              default), HKLM\SOFTWARE\WOW6432Node\Npcap\AdminOnly = 1 and
- *              non-elevated processes cannot open an adapter either. Setting
- *              it to 0 lets a standard user capture, at the cost of letting
- *              *every* local user capture.
+ *   npcap   — preferred. Shipped with Wireshark; `dumpcap.exe` declares
+ *             `asInvoker`, so a standard user captures without elevation.
+ *             Npcap may ask for confirmation once per process that opens an
+ *             adapter (an NpcapHelper prompt, not a UAC prompt), which is why
+ *             the adapter list is cached.
+ *   pktmon  — fallback. `PktMon` is a KERNEL_DRIVER whose device object is
+ *             Administrators-only: even the read-only `pktmon filter list`
+ *             returns exit 5 without elevation. Capturing therefore needs an
+ *             elevated process; `elevate.js` provides a one-shot helper so the
+ *             whole DSH does not have to run elevated.
  *
- * This module reports exactly which situation the machine is in and what the
- * user can do about it, so the panel and the agent tools can explain a failure
- * instead of showing an empty list. It never writes to the registry and never
- * demands elevation on its own.
+ * Measured on the development machine: `AdminOnly=1` in Npcap's registry key
+ * did NOT prevent non-elevated capture, and three consecutive captures yielded
+ * 164 / 100 / 83 packets without elevation. An earlier conclusion that
+ * "capture requires administrator rights" was wrong — it generalised from
+ * pktmon alone.
  */
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { run } from './pktmon.js';
-import { runElevatedCapture, elevationSupported } from './elevate.js';
+import { elevationSupported } from './elevate.js';
+import { probe as probeNpcap, listInterfaces, pickDefaultInterface, invalidateInterfaceCache } from './npcap.js';
 
 const SYS = process.env.SystemRoot || 'C:\\Windows';
 const PKTMON = join(SYS, 'System32', 'PktMon.exe');
-const NPCAP_DIRS = [
-  join(SYS, 'System32', 'Npcap'),
-  join(SYS, 'System32'),
-];
-/** Npcap writes its options under the 32-bit view of HKLM. */
 const NPCAP_KEY_WOW = 'HKLM\\SOFTWARE\\WOW6432Node\\Npcap';
 const NPCAP_KEY_NATIVE = 'HKLM\\SOFTWARE\\Npcap';
 
 /**
- * Read a single registry value, returning null when absent.
+ * Read one registry value, or null when absent.
  * @param {string} key
  * @param {string} name
  * @returns {Promise<string|null>}
@@ -44,167 +42,171 @@ const NPCAP_KEY_NATIVE = 'HKLM\\SOFTWARE\\Npcap';
 async function regQuery(key, name) {
   const r = await run('reg', ['query', key, '/v', name], { timeoutMs: 8000 });
   if (r.code !== 0) return null;
-  // Output shape: "    Name    REG_TYPE    value"
   const m = new RegExp(`${name}\\s+REG_\\w+\\s+(.+)`, 'i').exec(r.stdout);
   return m ? m[1].trim() : null;
 }
 
 /**
- * Locate the Npcap runtime directory, if Npcap is installed.
- * @returns {string|null}
- */
-export function npcapDir() {
-  for (const dir of NPCAP_DIRS) {
-    if (existsSync(join(dir, 'wpcap.dll'))) return dir;
-  }
-  return null;
-}
-
-/**
- * Describe the Npcap installation: presence, driver state, AdminOnly flag.
+ * Npcap's own configuration, reported for diagnostics.
+ *
+ * `AdminOnly` is surfaced informationally: it did not gate capture on the
+ * test machine, so the module never treats it as a hard blocker.
  * @returns {Promise<object>}
  */
-export async function probeNpcap() {
-  const dir = npcapDir();
-  const out = {
-    installed: dir !== null,
-    dir,
-    hasWpcap: false,
-    hasPacket: false,
-    hasHelper: false,
-    driverRunning: false,
-    adminOnly: null,
-    clickableCapture: false,
-    notes: [],
-  };
-  if (!dir) {
-    out.notes.push('未检测到 Npcap。');
-    return out;
-  }
-  out.hasWpcap = existsSync(join(dir, 'wpcap.dll'));
-  out.hasPacket = existsSync(join(dir, 'Packet.dll'));
-  out.hasHelper = existsSync(join(dir, 'NpcapHelper.exe'));
-
-  // Driver state. `sc query npcap` is readable without elevation.
-  const sc = await run('sc', ['query', 'npcap'], { timeoutMs: 8000 });
-  out.driverRunning = /STATE\s*:\s*4/.test(sc.stdout);
-
-  // AdminOnly lives in the 32-bit view on 64-bit Windows; check both.
+export async function probeNpcapConfig() {
+  const out = { adminOnly: null, winPcapCompatible: null, dir: null };
   let raw = await regQuery(NPCAP_KEY_WOW, 'AdminOnly');
   if (raw === null) raw = await regQuery(NPCAP_KEY_NATIVE, 'AdminOnly');
   if (raw !== null) {
-    // "0x1" or "1"
     const n = /^0x/i.test(raw) ? parseInt(raw, 16) : Number(raw);
     out.adminOnly = Number.isFinite(n) ? n : null;
   }
+  const wc = await regQuery(NPCAP_KEY_WOW, 'WinPcapCompatible')
+    ?? await regQuery(NPCAP_KEY_NATIVE, 'WinPcapCompatible');
+  if (wc !== null) {
+    const n = /^0x/i.test(wc) ? parseInt(wc, 16) : Number(wc);
+    out.winPcapCompatible = Number.isFinite(n) ? n : null;
+  }
+  out.dir = await regQuery(NPCAP_KEY_WOW, '')
+    ?? null;
+  return out;
+}
 
-  if (!out.driverRunning) {
-    out.notes.push('Npcap 驱动未运行（服务 npcap 不是 RUNNING 状态）。');
-  } else if (out.adminOnly === 1) {
-    out.clickableCapture = false;
-    out.notes.push('Npcap 已安装但设置了「仅管理员可访问」（AdminOnly=1），非提权进程打不开网卡。');
-    out.notes.push('若要免管理员抓包，以管理员身份执行一次：');
-    out.notes.push(`  reg add "${NPCAP_KEY_WOW}" /v AdminOnly /t REG_DWORD /d 0 /f`);
-    out.notes.push('注意：这会让本机所有用户都能抓包，请自行权衡。');
-  } else if (out.adminOnly === 0) {
-    out.clickableCapture = out.hasWpcap && out.hasPacket;
-    out.notes.push('Npcap 已放宽权限（AdminOnly=0），标准用户即可抓包。');
+/**
+ * Whether pktmon exists and whether it is usable without elevation.
+ * @returns {Promise<object>}
+ */
+export async function probePktmon() {
+  const exists = existsSync(PKTMON);
+  const out = { path: PKTMON, exists, usable: false, needsElevation: false, note: null };
+  if (!exists) {
+    out.note = '未找到 pktmon（需要 Windows 10 1809+ / Windows 11）。';
+    return out;
+  }
+  // `filter list` is the cheap read-only probe; the error text distinguishes
+  // "not elevated" from other failures.
+  const f = await run(PKTMON, ['filter', 'list'], { timeoutMs: 12000 });
+  const text = `${f.stdout}\n${f.stderr}`;
+  if (/access is denied|拒绝访问|无法与 PktMon 驱动程序通信/i.test(text)) {
+    out.needsElevation = true;
+    out.note = 'pktmon 需管理员权限（PktMon 是内核驱动，设备对象只对管理员开放）。';
+  } else if (f.code === 0) {
+    out.usable = true;
+    out.note = 'pktmon 可用（当前进程已提权）。';
   } else {
-    out.notes.push('Npcap 已安装，未能读取 AdminOnly（可能未设置或权限不足）。');
+    out.note = `pktmon 探测返回 code=${f.code}：${text.trim().slice(0, 200) || '(无输出)'}`;
   }
   return out;
 }
 
 /**
- * Whether a third-party CLI the plugin could delegate to is present.
- * Wireshark/tshark would give a ready-made capture path when Npcap is usable.
+ * Choose the backend for this machine.
+ *
+ * Preference order is npcap → pktmon + elevation → none, because npcap needs
+ * no elevation at all. `refreshInterfaces` forces a re-enumeration (which may
+ * cost one Npcap confirmation prompt).
+ *
+ * @param {{refreshInterfaces?:boolean}} [opts]
  * @returns {Promise<object>}
  */
-export async function probeCliTools() {
-  const tools = ['tshark', 'dumpcap'];
-  const found = {};
-  for (const t of tools) {
-    const r = await run('where', [t], { timeoutMs: 6000 });
-    found[t] = r.code === 0 ? (r.stdout.split('\n')[0] || '').trim() : null;
-  }
-  return found;
-}
-
-/**
- * Full environment report. This is the single source of truth for the panel,
- * the `capture_probe` tool, and the start/stop flows.
- * @returns {Promise<object>}
- */
-export async function probeEnvironment() {
-  const pktmonExists = existsSync(PKTMON);
+export async function probeEnvironment(opts = {}) {
   const result = {
     platform: process.platform,
     isWindows: process.platform === 'win32',
-    pktmonPath: PKTMON,
-    pktmonExists,
-    pktmonUsable: false,
-    pktmonNeedsElevation: false,
-    npcap: null,
-    cli: null,
-    elevation: null,
-    /** True when at least one path can capture without prompting the user. */
+    backend: null,
     canCapture: false,
-    /** True when a capture is possible only after a one-time elevation. */
-    canCaptureWithElevation: false,
+    /** True when a capture is only possible through the elevation prompt. */
+    needsElevation: false,
+    npcap: null,
+    npcapConfig: null,
+    pktmon: null,
+    interfaces: [],
+    defaultInterface: null,
+    elevation: null,
     notes: [],
   };
 
   if (!result.isWindows) {
-    result.notes.push(`当前平台 ${process.platform} 不受支持：本插件目前仅适配 Windows（pktmon / Npcap）。`);
+    result.notes.push(`当前平台 ${process.platform} 不受支持：本插件目前仅适配 Windows。`);
     return result;
   }
 
-  // --- pktmon ---
-  if (!pktmonExists) {
-    result.notes.push('未找到 pktmon（需要 Windows 10 1809+ / Windows 11）。');
-  } else {
-    // `filter list` is the cheap read-only probe; it also reveals elevation.
-    const f = await run(PKTMON, ['filter', 'list'], { timeoutMs: 12000 });
-    const text = `${f.stdout}\n${f.stderr}`;
-    if (/access is denied|拒绝访问|无法与 PktMon 驱动程序通信/i.test(text)) {
-      result.pktmonNeedsElevation = true;
-      result.notes.push('pktmon 需管理员权限（PktMon 是内核驱动，设备对象只对管理员开放）。');
-    } else if (f.code === 0) {
-      result.pktmonUsable = true;
-      result.canCapture = true;
-      result.notes.push('pktmon 可用，可直接实时抓包。');
-    } else {
-      result.notes.push(`pktmon 探测返回 code=${f.code}：${text.trim().slice(0, 200) || '(无输出)'}`);
-    }
-  }
-
-  // --- Npcap ---
-  result.npcap = await probeNpcap();
-  if (result.npcap.clickableCapture) {
+  // --- Npcap (preferred: no elevation) ---
+  if (opts.refreshInterfaces) invalidateInterfaceCache();
+  const np = await probeNpcap();
+  result.npcap = {
+    available: np.available,
+    dir: np.dir,
+    dumpcap: np.dumpcap || null,
+    tshark: np.tshark || null,
+    interfaceCount: (np.interfaces || []).length,
+    reason: np.reason || null,
+  };
+  result.npcapConfig = await probeNpcapConfig();
+  if (np.available) {
+    result.interfaces = np.interfaces || [];
+    result.defaultInterface = pickDefaultInterface(result.interfaces);
+    result.backend = 'npcap';
     result.canCapture = true;
+    result.notes.push(`Npcap 可用（Wireshark: ${np.dir}），无需管理员权限抓包。`);
+    if (!result.defaultInterface) {
+      result.canCapture = false;
+      result.backend = null;
+      result.notes.push('Npcap 可用但未找到物理网卡（只有虚拟/环回适配器）。');
+    } else {
+      result.notes.push(`默认网卡：${result.defaultInterface.label}（${result.defaultInterface.kind}）。`);
+    }
+    if (result.npcapConfig.adminOnly === 1) {
+      result.notes.push('注：Npcap 的 AdminOnly=1，但实测不阻止非提权抓包；首次打开网卡可能弹一次 Npcap 确认框。');
+    }
+  } else {
+    result.notes.push(`Npcap 不可用：${np.reason || '未检测到 Wireshark / dumpcap.exe'}。`);
   }
 
-  // --- 可委派的第三方 CLI ---
-  result.cli = await probeCliTools();
-  const tsharkPath = result.cli.tshark;
-  if (tsharkPath) {
-    result.notes.push(`检测到 tshark：${tsharkPath}（可作为抓包后端）。`);
-  }
+  // --- pktmon (fallback, needs elevation) ---
+  result.pktmon = await probePktmon();
+  if (result.pktmon.note) result.notes.push(result.pktmon.note);
 
-  // --- 提权代理可用性 ---
+  // --- elevation helper availability ---
   result.elevation = {
     supported: elevationSupported(),
     mechanism: 'runas-helper',
-    detail: result.pktmonExists
-      ? '可经 UAC 提权一次性启动抓包助手，无需让 DSH 常驻管理员。'
-      : '缺少 pktmon，提权也无后端可用。',
+    detail: '经 UAC 启动一次性抓包助手，DSH 本身保持普通权限。',
   };
-  if (!result.canCapture && result.pktmonExists && elevationSupported()) {
-    result.canCaptureWithElevation = true;
+
+  // Only offer the pktmon path when Npcap is unusable.
+  if (!result.canCapture && result.pktmon.exists) {
+    if (result.pktmon.usable) {
+      result.backend = 'pktmon';
+      result.canCapture = true;
+      result.notes.push('将使用 pktmon（当前进程已提权）。');
+    } else if (result.pktmon.needsElevation) {
+      result.needsElevation = true;
+      if (result.elevation.supported) {
+        result.backend = 'pktmon';
+        result.canCapture = true;
+        result.notes.push('将使用 pktmon + 一次性提权助手（会弹一次 UAC）。');
+        result.notes.push('若希望完全免提权：安装 Wireshark（自带 Npcap），本插件会自动改用它。');
+      } else {
+        result.notes.push('pktmon 需提权，但提权助手不可用（缺少 run-elevated.ps1）。');
+      }
+    }
   }
 
-  if (!result.canCapture && !result.canCaptureWithElevation) {
+  if (!result.canCapture) {
     result.notes.push('当前没有可用的抓包路径。');
   }
   return result;
+}
+
+/**
+ * Backend summary for a UI badge.
+ * @param {object} env result of probeEnvironment
+ * @returns {string}
+ */
+export function backendLabel(env) {
+  if (!env) return '未知';
+  if (env.backend === 'npcap') return 'Npcap (dumpcap)';
+  if (env.backend === 'pktmon') return env.needsElevation ? 'pktmon (需提权)' : 'pktmon';
+  return '不可用';
 }

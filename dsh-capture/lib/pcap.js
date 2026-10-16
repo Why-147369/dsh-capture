@@ -413,6 +413,8 @@ function parsePcapng(buf, maxPackets) {
   const packets = [];
   const stats = { malformed: 0, truncated: 0, unsupportedLink: 0, blocks: 0 };
   const linkTypes = [];
+  /** Version from the most recent Section Header Block (informational). */
+  let sectionVersion = null;
 
   while (off + 12 <= buf.length && packets.length < maxPackets) {
     const blockType = buf.readUInt32LE(off);
@@ -425,8 +427,30 @@ function parsePcapng(buf, maxPackets) {
         stats.truncated++;
         break;
       }
-      const linkType = le ? buf.readUInt32LE(off + 20) : buf.readUInt32BE(off + 20);
-      if (off + 24 <= buf.length) linkTypes.push(linkType);
+      // The SHB carries no link type: its layout is
+      //   type(4) len(4) byte-order-magic(4) major(2) minor(2)
+      //   section-length(8) options…
+      // Reading a link type here would land in the options area and yield
+      // garbage. The real link type lives in each Interface Description Block.
+      const major = le ? buf.readUInt16LE(off + 12) : buf.readUInt16BE(off + 12);
+      const minor = le ? buf.readUInt16LE(off + 14) : buf.readUInt16BE(off + 14);
+      sectionVersion = { major, minor };
+      // A new section resets the per-interface link types.
+      linkTypes.length = 0;
+      stats.blocks++;
+      off += totalLen;
+      continue;
+    }
+    if (blockType === 0x00000001) {
+      // Interface Description Block:
+      //   type(4) len(4) linktype(2@8) reserved(2@10) snaplen(4@12) options…
+      const totalLen = buf.readUInt32LE(off + 4);
+      if (!Number.isFinite(totalLen) || totalLen < 20 || off + totalLen > buf.length) {
+        stats.truncated++;
+        break;
+      }
+      const linkType = buf.readUInt16LE(off + 8);
+      linkTypes.push(linkType);
       stats.blocks++;
       off += totalLen;
       continue;
@@ -466,15 +490,19 @@ function parsePcapng(buf, maxPackets) {
         if (pkt) packets.push(pkt);
       }
       stats.blocks++;
-    } else if (blockType === 0x00000001 || blockType === 0x00000005 || blockType === 0x00000004) {
-      // Interface Description / Interface Statistics / Name Resolution: skip.
+    } else if (blockType === 0x00000005 || blockType === 0x00000004) {
+      // Interface Statistics / Name Resolution: nothing to decode here.
       stats.blocks++;
     } else {
       stats.blocks++;
     }
     off += totalLen;
   }
-  return assemble(packets, stats, { format: 'pcapng', linkType: linkTypes[linkTypes.length - 1] ?? null });
+  return assemble(packets, stats, {
+    format: 'pcapng',
+    linkType: linkTypes[linkTypes.length - 1] ?? null,
+    version: sectionVersion,
+  });
 }
 
 /**
