@@ -5,6 +5,45 @@
 > **状态说明**：本插件**未开发完成**，处于**测试阶段**。在 1.0.0 之前，
 > API、配置项与文件格式均可能在不通知的情况下变更。
 
+## [0.6.1] — 2026-10-16
+
+本版本修掉一个**客户端主题适配的实际 bug**，并补上能发现这类问题的契约测试。
+
+### 修复
+
+- **面板用了 8 个宿主根本不存在的主题 token**（客户端「浅色模式难看」的根因）
+  - 之前用 `--dsw-alias-bg-secondary` / `bg-primary` / `bg-tertiary` /
+    `text-primary` / `text-tertiary` / `border-secondary` / `border-danger` /
+    `text-danger` —— 实测宿主
+    `@deepseek-ai/dsh-client-ui-theme` 的 107 个 token 里**一个都没有**，
+    只有 `brand-primary` 是对的
+  - 后果：每个声明都落到写死的暗色回退值（`#e6e6e6` 文字 / `#222` 背景 /
+    `rgba(255,255,255,.x)` 边框），等于**硬编码深色主题** ——
+    浅色模式下就是深色卡片 + 低对比文字。而 README 当时声称"样式走主题 token"，
+    属不实描述
+  - 现改用真实存在的 12 个 token：`label-primary` / `label-tertiary` /
+    `bg-layer-1` / `bg-layer-2` / `border-l2` / `interactive-bg-hover` /
+    `settings-card-fill` / `settings-card-stroke` / `brand-primary` /
+    `state-idle-primary` / `state-error-primary` / `state-error-secondary`
+  - 同时**移除所有字面色回退值**：token 缺失时宁可继承，也不要静默变成另一种主题
+
+### 新增
+
+- **客户端 bundle 契约测试 `test/client-contract.test.mjs`（14 项）**
+  - 在沙箱里**真执行 `client.js`**（假 `window.__ModuleLoader__` + 最小 React 替身）
+  - 校验：`load` 的 id、factory 返回 `module.exports` 的 CommonJS 契约、
+    `inject` 声明、`settings.section` 注册形状（用 id 而非 key）、
+    面板组件真渲染且产出控件文本、只 `require('react')`、
+    **只允许使用宿主真实存在的 token**、无写死颜色、token 无字面色回退
+  - 这正是本轮开发中 5 个"只能靠重启 DSH 用眼睛看"才能发现的 client bug 的
+    自动化替代品（裸 return、slot 选错、缺 icon、缺 locale、token 名编造）
+
+### 变更
+
+- CI 步骤增加：pcapng IDB 回归、TCP 重组、流式解析、客户端契约（共 6 个测试套件）
+- README 的"样式走主题 token"改为可验证陈述，并新增"面板视觉未逐像素核对"的
+  诚实标注
+
 ## [0.6.0] — 2026-10-16
 
 本版本补上最后一块边界能力：**大文件流式解析**。此前分析必须整文件读入内存

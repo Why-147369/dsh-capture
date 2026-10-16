@@ -231,38 +231,44 @@ window.__ModuleLoader__.load({
       const notes = backend && Array.isArray(backend.notes) ? backend.notes : [];
 
       return h('div', { className: 'dshcap-root' },
-        // Host theme tokens only; no literal colors in containers/controls.
+        // Host theme tokens only — and only token names the host actually ships.
+        // The names below come from `@deepseek-ai/dsh-client-ui-theme`'s token
+        // table (107 entries): label-*, bg-layer-*, border-l*, interactive-bg-*,
+        // settings-card-*, brand-primary, state-error-*. Invented names such as
+        // `--dsw-alias-bg-secondary` are NOT defined by the host, so any literal
+        // fallback behind them would silently become the real theme — i.e. a
+        // hardcoded dark panel in light mode. Hence: no color fallbacks.
         h('style', null, `
-          .dshcap-root { display:flex; flex-direction:column; gap:10px; padding:10px; font-size:12px; color:var(--dsw-alias-text-primary,#e6e6e6); }
+          .dshcap-root { display:flex; flex-direction:column; gap:10px; padding:10px; font-size:12px; color:var(--dsw-alias-label-primary); }
           .dshcap-title { font-size:13px; font-weight:600; display:flex; align-items:center; justify-content:space-between; gap:8px; }
           .dshcap-dot { width:8px; height:8px; border-radius:50%; display:inline-block; }
-          .dshcap-card { border:1px solid var(--dsw-alias-border-secondary,rgba(255,255,255,.12)); border-radius:8px; padding:8px; background:var(--dsw-alias-bg-secondary,transparent); }
+          .dshcap-card { border:1px solid var(--dsw-alias-settings-card-stroke); border-radius:8px; padding:8px; background:var(--dsw-alias-settings-card-fill); }
           .dshcap-row { display:flex; gap:8px; flex-wrap:wrap; }
           .dshcap-cell { flex:1 1 72px; min-width:72px; }
-          .dshcap-cell-label { opacity:.6; font-size:11px; }
+          .dshcap-cell-label { color:var(--dsw-alias-label-tertiary); font-size:11px; }
           .dshcap-cell-value { font-variant-numeric:tabular-nums; font-size:13px; }
-          .dshcap-btn { border:1px solid var(--dsw-alias-border-secondary,rgba(255,255,255,.18)); background:var(--dsw-alias-bg-primary,transparent); color:inherit; border-radius:6px; padding:4px 10px; cursor:pointer; font-size:12px; }
-          .dshcap-btn:hover:not(:disabled) { background:var(--dsw-alias-bg-tertiary,rgba(255,255,255,.06)); }
+          .dshcap-btn { border:1px solid var(--dsw-alias-border-l2); background:var(--dsw-alias-bg-layer-1); color:var(--dsw-alias-label-primary); border-radius:6px; padding:4px 10px; cursor:pointer; font-size:12px; }
+          .dshcap-btn:hover:not(:disabled) { background:var(--dsw-alias-interactive-bg-hover); }
           .dshcap-btn:disabled { opacity:.45; cursor:default; }
-          .dshcap-btn-primary { border-color:var(--dsw-alias-brand-primary,#247bbf); color:var(--dsw-alias-brand-primary,#247bbf); }
-          .dshcap-input { width:100%; box-sizing:border-box; background:var(--dsw-alias-bg-primary,transparent); color:inherit; border:1px solid var(--dsw-alias-border-secondary,rgba(255,255,255,.18)); border-radius:6px; padding:4px 6px; font-size:12px; font-family:inherit; }
-          /* A <select> needs the host page background so the native dropdown
+          .dshcap-btn-primary { border-color:var(--dsw-alias-brand-primary); color:var(--dsw-alias-brand-primary); }
+          .dshcap-input { width:100%; box-sizing:border-box; background:var(--dsw-alias-bg-layer-1); color:var(--dsw-alias-label-primary); border:1px solid var(--dsw-alias-border-l2); border-radius:6px; padding:4px 6px; font-size:12px; font-family:inherit; }
+          /* A <select> needs the host layer background so the native dropdown
              popup does not render as an unreadable system default. */
-          select.dshcap-input { background:var(--dsw-alias-bg-secondary,#222); appearance:auto; }
-          select.dshcap-input option { background:var(--dsw-alias-bg-secondary,#222); color:inherit; }
-          .dshcap-note { opacity:.7; font-size:11px; line-height:1.5; }
+          select.dshcap-input { background:var(--dsw-alias-bg-layer-1); appearance:auto; }
+          select.dshcap-input option { background:var(--dsw-alias-bg-layer-1); color:var(--dsw-alias-label-primary); }
+          .dshcap-note { color:var(--dsw-alias-label-tertiary); font-size:11px; line-height:1.5; }
           .dshcap-msg { border-radius:6px; padding:6px 8px; font-size:11px; line-height:1.5; }
-          .dshcap-msg-ok { background:var(--dsw-alias-bg-tertiary,rgba(255,255,255,.06)); }
-          .dshcap-msg-error { border:1px solid var(--dsw-alias-border-danger,rgba(255,80,80,.5)); color:var(--dsw-alias-text-danger,#ff8080); }
+          .dshcap-msg-ok { background:var(--dsw-alias-bg-layer-2); }
+          .dshcap-msg-error { border:1px solid var(--dsw-alias-state-error-secondary); color:var(--dsw-alias-state-error-primary); }
           .dshcap-list { display:flex; flex-direction:column; gap:4px; max-height:190px; overflow:auto; }
           .dshcap-item { display:flex; align-items:center; gap:6px; padding:4px 6px; border-radius:6px; border:1px solid transparent; }
-          .dshcap-item:hover { background:var(--dsw-alias-bg-tertiary,rgba(255,255,255,.05)); }
-          .dshcap-item-active { border-color:var(--dsw-alias-brand-primary,#247bbf); }
+          .dshcap-item:hover { background:var(--dsw-alias-interactive-bg-hover); }
+          .dshcap-item-active { border-color:var(--dsw-alias-brand-primary); }
           .dshcap-name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-          .dshcap-meta { opacity:.6; font-size:11px; }
+          .dshcap-meta { color:var(--dsw-alias-label-tertiary); font-size:11px; }
           .dshcap-mono { font-family:ui-monospace,Menlo,Consolas,monospace; font-size:11px; word-break:break-all; }
           .dshcap-tags { display:flex; flex-wrap:wrap; gap:4px; }
-          .dshcap-tag { border:1px solid var(--dsw-alias-border-secondary,rgba(255,255,255,.16)); border-radius:10px; padding:1px 7px; font-size:11px; }
+          .dshcap-tag { border:1px solid var(--dsw-alias-border-l2); border-radius:10px; padding:1px 7px; font-size:11px; }
         `),
 
         h('div', { className: 'dshcap-title' },
@@ -270,7 +276,7 @@ window.__ModuleLoader__.load({
           h('span', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
             h('span', {
               className: 'dshcap-dot',
-              style: { background: running ? 'var(--dsw-alias-brand-primary,#247bbf)' : 'var(--dsw-alias-text-tertiary,#888)' },
+              style: { background: running ? 'var(--dsw-alias-brand-primary)' : 'var(--dsw-alias-state-idle-primary)' },
             }),
             h('span', { className: 'dshcap-meta' }, running ? '抓包中' : '空闲'),
           ),

@@ -77,7 +77,9 @@
 - 方法校验（`GET /start` → 405）、无效 id → 404、路径穿越 id → 404
 - 包级浏览分页与协议/端口过滤、CSV/JSON 导出、正则检索（无效正则返 400）
 - Client bundle 契约、slot 注册（`settings.section`）、图标与 manifest 契约
-- 装机验证共 **48 项**、单元/契约测试 **5 组全过**、端到端 **9 项**
+- **客户端契约测试（14 项）**：在沙箱里真执行 `client.js` —— 导出契约、slot 注册形状、
+  面板真渲染、**只允许使用宿主真实存在的 12 个 `--dsw-alias-*` token**、无写死颜色
+- 装机验证共 **48 项**、单元/契约测试 **6 组全过**、端到端 **9 项**
 
 ### 未验证 / 已知问题 ⚠️
 
@@ -90,8 +92,9 @@
 - **chunked 响应体未拼接**：`Transfer-Encoding: chunked` 只记录头部，不还原分块体
 - **流式解析的包数组仍随包数增长**：受 `maxAnalyzePackets` 约束，不是无上限；
   真正需要任意大时可先按 BPF 裁剪抓包
+- **面板的视觉呈现未在真机上逐像素核对**：契约测试能证明它注册正确、能渲染出
+  控件、且只用真实 token，但"在你当前主题下看起来好不好看"仍需肉眼确认
 - 抓包文件无自动清理策略（Npcap 后端支持 `ringFileMb` 回绕，但旧文件需手动删）
-- 设置页 UI 的深浅主题适配仅按 token 规则编写，未在真实页面逐项核对
 - 仅 Windows；macOS / Linux 未支持
 
 ## 安装（本地开发版）
@@ -225,6 +228,7 @@ node dsh-capture/test/selftest.mjs               # 解析器基础自测
 node dsh-capture/test/pcapng-idb.test.mjs        # pcapng IDB 偏移 + if_tsresol 回归
 node dsh-capture/test/stream-reassembly.test.mjs # TCP 重组 / HTTP 体 / TLS 详情（7 组）
 node dsh-capture/test/streaming.test.mjs         # 流式解析 + 路由接线（9 组）
+node dsh-capture/test/client-contract.test.mjs   # 客户端 bundle 契约（14 项，真执行 client.js）
 node dsh-capture/test/routes.test.mjs            # 路由契约（23 项，CI 可裸跑）
 ```
 
@@ -256,6 +260,7 @@ dsh-capture/
     ├── pcapng-idb.test.mjs        # IDB 偏移 + if_tsresol 回归
     ├── stream-reassembly.test.mjs # TCP 重组 / HTTP 体 / TLS 详情（7 组）
     ├── streaming.test.mjs         # 流式解析 + 路由接线（9 组）
+    ├── client-contract.test.mjs   # 客户端 bundle 契约（14 项，真执行 client.js）
     └── routes.test.mjs            # 路由契约（23 项，无需已安装 profile）
 ```
 
