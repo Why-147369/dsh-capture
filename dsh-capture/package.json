@@ -1,10 +1,11 @@
 {
   "name": "dsh-capture",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Packet capture and traffic analysis for DeepSeek Harness: Npcap/dumpcap (no elevation) or pktmon backends, pcapng parsing, HTTP/DNS/TCP flow extraction, and agent tools to inspect traffic. 面向 DeepSeek Harness 的抓包与流量分析插件：Npcap/dumpcap（免提权）或 pktmon 后端、pcapng 解析、HTTP/DNS/TCP 会话提取，并提供 agent 工具分析流量。",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
+  "types": "./types/index.d.ts",
   "icon": "./icon.svg",
   "engines": {
     "node": ">=22"
@@ -15,12 +16,14 @@
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
     "./locale/en.json": "./locale/en.json",
-    "./locale/zh.json": "./locale/zh.json"
+    "./locale/zh.json": "./locale/zh.json",
+    "./types": "./types/index.d.ts"
   },
   "files": [
     "lib",
     "client",
     "locale",
+    "types",
     "cordis.patch.yml",
     "icon.svg",
     "README.md"
@@ -50,6 +53,6 @@
   },
   "meta": {
     "title": "Capture / 抓包与流量分析",
-    "description": "Windows pktmon 实时抓包、pcapng 解析、HTTP/DNS/TCP 会话提取与 agent 分析工具。"
+    "description": "实时抓包（Npcap/dumpcap 免提权，或 pktmon）、pcapng 解析、TCP 流重组、HTTP 事务与报文体、TLS 握手详情，并提供 agent 分析工具。"
   }
 }

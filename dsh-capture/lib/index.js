@@ -17,15 +17,16 @@
  * `dsh.profile.bundles` while the profile patch also inserts it), the second
  * fiber no-ops instead of throwing on the duplicate-route contract.
  */
-import { readFileSync, statSync } from 'node:fs';
-import { basename } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import z from '@deepseek-ai/schemastery';
 import { parseCapture, DNS_TYPES, isoTime } from './pcap.js';
 import { mountRoutes } from './routes.js';
 import { clearFilters } from './pktmon.js';
 import { probeEnvironment } from './perm.js';
+import { countPacketBlocks } from './npcap.js';
 import {
-  captureDir, listCaptures, resolveCaptureId,
+  captureDir, listCaptures, resolveCaptureId, readState, liveStatus,
   startCaptureFlow, stopCaptureFlow,
 } from './tools.js';
 
@@ -131,6 +132,29 @@ function parseOptsFrom(cfg) {
 let mounted = false;
 
 /**
+ * Build a logger bound to the host's logger service when present.
+ *
+ * The host exposes `ctx.logger` on some profiles only, so this degrades to a
+ * no-op instead of throwing — a missing logger must never break the plugin.
+ *
+ * @param {object} ctx host context
+ * @returns {{info:Function, warn:Function, error:Function, debug:Function, available:boolean}}
+ */
+function makeLogger(ctx) {
+  const raw = ctx && ctx.logger;
+  const noop = () => {};
+  const has = (n) => raw && typeof raw[n] === 'function';
+  const level = (n, fallback) => (has(n) ? raw[n].bind(raw) : (has(fallback) ? raw[fallback].bind(raw) : noop));
+  return {
+    available: !!raw,
+    debug: level('debug', 'info'),
+    info: level('info', 'log'),
+    warn: level('warn', 'info'),
+    error: level('error', 'warn'),
+  };
+}
+
+/**
  * Register the plugin against the host context.
  * @param {object} ctx host context (may acquire webServer and tools services)
  * @param {object} config optional profile override
@@ -139,15 +163,19 @@ export function apply(ctx, config) {
   // Normalize once: schemastery gives a validated object, but a direct unit
   // test may pass a plain object or nothing at all.
   const cfg = readConfig(config);
+  const log = makeLogger(ctx);
+  log.info('[dsh-capture] 加载中：reassemble=%s streamCapKb=%s maxStreams=%s', cfg.reassemble, cfg.streamCapKb, cfg.maxStreams);
 
   ctx.inject(['webServer'], (hostCtx) => {
     hostCtx.effect(() => {
       if (mounted) return;
       mounted = true;
       const disposeRoutes = mountRoutes(hostCtx, cfg);
+      log.info('[dsh-capture] 已挂载 13 条 HTTP 路由');
       return () => {
         mounted = false;
         disposeRoutes();
+        log.info('[dsh-capture] 路由已卸载');
       };
     }, 'dsh-capture: http routes');
   });
@@ -155,7 +183,7 @@ export function apply(ctx, config) {
   // Agent tools are optional: a profile without the tools service still gets
   // the HTTP panel, so this stays behind an inject instead of throwing.
   ctx.inject(['tools'], (toolCtx) => {
-    toolCtx.effect(() => registerTools(toolCtx, cfg), 'dsh-capture: agent tools');
+    toolCtx.effect(() => registerTools(toolCtx, cfg, log), 'dsh-capture: agent tools');
   });
 }
 
@@ -163,9 +191,10 @@ export function apply(ctx, config) {
  * Build the tool surface.
  * @param {object} ctx context carrying the tools service
  * @param {object} cfg plugin config
+ * @param {object} [log] logger from makeLogger
  * @returns {() => void} disposer
  */
-function registerTools(ctx, cfg) {
+function registerTools(ctx, cfg, log = null) {
   const disposers = [];
   const tools = ctx.tools;
   if (!tools || typeof tools.register !== 'function') return () => {};
@@ -447,6 +476,70 @@ function registerTools(ctx, cfg) {
     },
   });
 
+  // 实时查看：抓包进行中不停止也能看进度与已落盘内容。
+  add({
+    name: 'capture_status',
+    description:
+      '在**不停止抓包**的前提下查看当前抓包进度：已落盘包数/字节、抓包时长、后端与网卡，以及已捕获到的 DNS/SNI 预览。长抓包时用它轮询，确认目标流量已经进来，再调用 capture_stop。',
+    parameters: {
+      sessionId: { type: 'string', description: 'capture_start 返回的 sessionId。省略时报告当前活动会话。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        required: true,
+        properties: { ok: { type: 'boolean', required: true } },
+      },
+      render: (_args, value) => {
+        if (!value.ok) return [{ type: 'text', text: `查询失败：${value.error ?? ''}` }];
+        if (!value.running) {
+          return [{ type: 'text', text: `当前没有进行中的抓包。${value.lastFile ? `最近文件：${value.lastFile}` : ''}` }];
+        }
+        const lines = [
+          `抓包中：${value.backend} / ${value.ifaceLabel || value.device || '—'}`,
+          `已落盘 ${value.packets} 包 / ${(value.bytes / 1024).toFixed(1)} KB，时长 ${value.elapsedSec}s`,
+          `文件 ${value.file}`,
+        ];
+        if (value.preview) {
+          const p = value.preview;
+          lines.push(`预览（最近一次解析）：DNS ${p.dns} | SNI ${p.sni} | TLS 握手 ${p.tls} | HTTP 事务 ${p.httpTransactions}`);
+          if (p.sniNames?.length) lines.push('SNI: ' + p.sniNames.slice(0, 8).join(', '));
+        }
+        return [{ type: 'text', text: lines.join('\n') }];
+      },
+    },
+    execute: async (args) => statusTool(String(args?.sessionId ?? ''), cfg),
+  });
+
+  // 导出：把抓包写成 CSV / JSON 落到抓包目录，返回路径。
+  add({
+    name: 'capture_export',
+    description:
+      '把一个抓包导出成结构化文件并返回路径：CSV（每包一行，含时间/协议/地址/端口/字节/SNI/TLS/DNS/HTTP 列，带 BOM，Excel 可直接打开）或 JSON（含 meta/stats/reassembly/talkers/DNS/SNI/HTTP/TLS/流与 HTTP 事务）。',
+    parameters: {
+      id: { type: 'string', required: true, description: 'capture_list 返回的抓包 id。' },
+      format: { type: 'string', enum: ['csv', 'json'], description: '导出格式，默认 csv。' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: true,
+        required: true,
+        properties: { ok: { type: 'boolean', required: true } },
+      },
+      render: (_args, value) => {
+        if (!value.ok) return [{ type: 'text', text: `导出失败：${value.error ?? ''}` }];
+        return [{
+          type: 'text',
+          text: `已导出 ${value.format.toUpperCase()}：${value.path}\n`
+            + `${value.rows != null ? `行数 ${value.rows} | ` : ''}大小 ${(value.sizeBytes / 1024).toFixed(1)} KB`,
+        }];
+      },
+    },
+    execute: async (args) => exportCapture(String(args?.id ?? ''), String(args?.format ?? 'csv').toLowerCase(), cfg),
+  });
+
   return () => {
     // Drop any pktmon filter this plugin installed, then drop registrations.
     clearFilters().catch(() => {});
@@ -546,4 +639,153 @@ function searchCapture(full, q, limit, cfg) {
     transactions: (parsed.streams || []).filter((s) => hit(s.host) || hit(s.path) || hit(s.method)
       || hit(s.requestBody) || hit(s.responseBody)).slice(0, limit),
   };
+}
+
+/**
+ * Live status of an in-flight capture, without stopping it.
+ *
+ * The packet count is read from the file on disk (dumpcap flushes block by
+ * block), so this is safe to poll while capturing.
+ *
+ * @param {string} sessionId session from capture_start, or '' for the active one
+ * @param {object} cfg normalized config
+ * @returns {object}
+ */
+function statusTool(sessionId, cfg) {
+  const live = liveStatus();
+  // liveStatus() reports the single in-flight capture recorded in state.json
+  // (flat shape, not a list) — see tools.js.
+  if (!live || !live.running) {
+    const state = live?.state || readState();
+    return {
+      ok: true,
+      running: false,
+      lastFile: state?.pcapng || state?.file || state?.etl || null,
+      note: '当前没有进行中的抓包。用 capture_start 开始，或 capture_list 查看已保存文件。',
+    };
+  }
+
+  // A caller-supplied sessionId must match, otherwise this is a stale query.
+  if (sessionId && live.sessionId && live.sessionId !== sessionId) {
+    return { ok: false, error: `sessionId 不匹配：当前活动会话是 ${live.sessionId}。` };
+  }
+
+  const st = (() => {
+    if (Number.isFinite(live.packets)) return { packets: live.packets, bytes: live.bytes ?? null };
+    try {
+      if (live.file && existsSync(live.file)) return countPacketBlocks(live.file);
+    } catch { /* fall through */ }
+    return { packets: null, bytes: null };
+  })();
+
+  // Bounded preview of what has landed so far; reassembly is skipped so polling
+  // stays cheap on a long capture.
+  let preview = null;
+  try {
+    if (live.file && existsSync(live.file)) {
+      const size = statSync(live.file).size;
+      if (size > 0 && size <= 8 * 1024 * 1024) {
+        const p = parseCapture(readFileSync(live.file), { maxPackets: maxPacketsFrom(cfg), reassemble: false });
+        preview = {
+          dns: p.dns.length,
+          sni: p.sni.length,
+          tls: (p.tls || []).length,
+          httpTransactions: (p.httpTransactions || []).length,
+          sniNames: p.sni.slice(0, 10).map((s) => s.name),
+        };
+      }
+    }
+  } catch { preview = null; }
+
+  const startedAt = live.state?.startedAt ?? live.startedAt ?? null;
+  return {
+    ok: true,
+    running: true,
+    backend: live.backend || 'npcap',
+    sessionId: live.sessionId ?? live.state?.sessionId ?? null,
+    file: live.file || null,
+    device: live.device ?? live.state?.device ?? null,
+    ifaceLabel: live.ifaceLabel ?? live.state?.ifaceLabel ?? null,
+    packets: st.packets,
+    bytes: st.bytes,
+    elapsedSec: startedAt ? Math.round((Date.now() - startedAt) / 1000) : null,
+    preview,
+  };
+}
+
+/**
+ * Export a capture to CSV or JSON on disk and report the path.
+ *
+ * The routes expose the same data over HTTP; this writes a file so a headless
+ * agent can hand the artifact to the user without a browser.
+ *
+ * @param {string} id capture id
+ * @param {string} format 'csv' | 'json'
+ * @param {object} cfg normalized config
+ * @returns {object}
+ */
+function exportCapture(id, format, cfg) {
+  const full = resolveCaptureId(String(id ?? ''));
+  if (!full) return { ok: false, error: 'capture id 无效或文件已删除。先用 capture_list 获取有效 id。' };
+  const fmt = format === 'json' ? 'json' : 'csv';
+
+  let parsed;
+  try {
+    const st = statSync(full);
+    const cap = Number.isFinite(cfg?.maxAnalyzeBytes) ? cfg.maxAnalyzeBytes : DEFAULTS.maxAnalyzeBytes;
+    if (st.size > cap) {
+      return { ok: false, error: `抓包文件 ${(st.size / 1048576).toFixed(1)} MB 超过分析上限 ${(cap / 1048576).toFixed(0)} MB。` };
+    }
+    // Reassembly off: the tabular export is per-packet, and this keeps memory flat.
+    parsed = parseCapture(readFileSync(full), { maxPackets: maxPacketsFrom(cfg), reassemble: false });
+  } catch (e) {
+    return { ok: false, error: `解析失败：${e.message}` };
+  }
+
+  const dir = captureDir();
+  mkdirSync(dir, { recursive: true });
+  const base = basename(full).replace(/\.[^.]+$/, '');
+  const out = join(dir, `${base}-export.${fmt}`);
+
+  try {
+    if (fmt === 'csv') {
+      const esc = (v) => {
+        const s = v === null || v === undefined ? '' : String(v);
+        return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      };
+      const head = ['index', 'time', 'ts', 'proto', 'src', 'dst', 'sport', 'dport', 'bytes', 'sni', 'tls', 'dns', 'http'];
+      const rows = [head.join(',')];
+      parsed.packets.forEach((p, i) => {
+        rows.push([
+          i, isoTime(p.ts) ?? '', p.ts ?? '', p.proto ?? '', p.src ?? '', p.dst ?? '',
+          p.sport ?? '', p.dport ?? '', p.bytes ?? '',
+          p.sni ?? '',
+          p.tls ? (p.tls.role === 'client'
+            ? `ClientHello ${p.tls.clientVersionName || ''}`
+            : `ServerHello ${p.tls.negotiatedVersionName || ''} ${p.tls.cipherSuite || ''}`) : '',
+          p.dns ? p.dns.queries.map((x) => x.name).join(' ') : '',
+          p.http ? (p.http.method ? `${p.http.method} ${p.http.path}` : `HTTP ${p.http.status}`) : '',
+        ].map(esc).join(','));
+      });
+      // BOM so Excel reads UTF-8 correctly.
+      writeFileSync(out, '\uFEFF' + rows.join('\r\n'), 'utf8');
+      return { ok: true, format: 'csv', path: out, rows: parsed.packets.length, sizeBytes: statSync(out).size };
+    }
+
+    const body = JSON.stringify({
+      file: basename(full),
+      meta: parsed.meta,
+      stats: parsed.stats,
+      talkers: parsed.talkers,
+      topPorts: parsed.topPorts,
+      dns: parsed.dns.map((d) => ({ ...d, type: DNS_TYPES[d.type] || String(d.type) })),
+      sni: parsed.sni,
+      http: parsed.http,
+      tls: parsed.tls,
+    }, null, 2);
+    writeFileSync(out, body, 'utf8');
+    return { ok: true, format: 'json', path: out, rows: parsed.packets.length, sizeBytes: statSync(out).size };
+  } catch (e) {
+    return { ok: false, error: `写文件失败：${e.message}` };
+  }
 }

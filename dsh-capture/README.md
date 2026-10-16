@@ -153,9 +153,11 @@ reg add "HKLM\SOFTWARE\WOW6432Node\Npcap" /v AdminOnly /t REG_DWORD /d 0 /f
 | `capture_probe` | 报告选定后端（Npcap / pktmon）、权限需求、可用网卡与默认网卡 |
 | `capture_list` | 列出已保存抓包，返回寻址用 id 与**包数** |
 | `capture_start` | 开始抓包。支持 `device`（网卡）、`bpf`（原始 libpcap 表达式）、`filters`（结构化）、`snaplen`、`durationSec`、`ringFileMb` |
+| `capture_status` | **不停止抓包**也能看进度：已落盘包数/字节、时长、后端、已捕获 DNS/SNI 预览 |
 | `capture_stop` | 停止并返回包数（Npcap 直接停；pktmon 转 pcapng） |
 | `capture_analyze` | 解析抓包 → 摘要（会话/端口/DNS/**TLS 握手**/HTTP）＋ **重组后的 TCP 流与 HTTP 请求/响应配对（含报文体）** |
 | `capture_search` | 在抓包里按关键词检索，**包含重组后的 HTTP 报文体**（"有没有连过 X"／"哪个请求带了这个字段"） |
+| `capture_export` | 导出 CSV / JSON 到抓包目录并返回路径（无浏览器也能拿产物） |
 
 典型用法：
 
@@ -163,9 +165,11 @@ reg add "HKLM\SOFTWARE\WOW6432Node\Npcap" /v AdminOnly /t REG_DWORD /d 0 /f
 1. capture_probe                              → 看后端与可选网卡
 2. capture_start {bpf:"tcp port 443"}         → 只抓 HTTPS，文件小
 3. （复现目标操作）
-4. capture_stop                               → 拿到 id 与包数
-5. capture_analyze {id, topN:30}              → 看流量摘要 + HTTP 事务 + TLS 握手
-6. capture_search {id, query:"api.xxx"}       → 确认是否访问过某域名/某字段
+4. capture_status                             → 长抓包时轮询，确认目标流量已进来
+5. capture_stop                               → 拿到 id 与包数
+6. capture_analyze {id, topN:30}              → 看流量摘要 + HTTP 事务 + TLS 握手
+7. capture_search {id, query:"api.xxx"}       → 确认是否访问过某域名/某字段
+8. capture_export {id, format:"csv"}          → 拿结构化文件
 ```
 
 ## HTTP 路由
@@ -209,13 +213,17 @@ node repoint-dsh-capture.mjs              # 备份 + 改依赖 + pnpm install + 
 node sync-dsh-capture.mjs
 
 # 验证
-node verify-installed.mjs              # 装机回归 38 项（含重组/HTTP 事务/TLS/时间戳）
+node verify-installed.mjs              # 装机回归 45 项（后端/网卡/BPF/路由/重组/工具/类型）
 node verify-icon.cjs                   # 图标与 manifest
 node recheck-22.mjs                    # 完成度清单复核（22 项）
-node dsh-capture/test/selftest.mjs              # 解析器基础自测
-node dsh-capture/test/pcapng-idb.test.mjs       # pcapng IDB 回归（真实形状，带 options）
+node dsh-capture/test/selftest.mjs               # 解析器基础自测
+node dsh-capture/test/pcapng-idb.test.mjs        # pcapng IDB 偏移 + if_tsresol 回归
 node dsh-capture/test/stream-reassembly.test.mjs # TCP 重组 / HTTP 体 / TLS 详情（7 组）
+node dsh-capture/test/routes.test.mjs            # 路由契约（23 项，CI 可裸跑）
 ```
+
+`test/routes.test.mjs` 用假 host context 挂载真实路由，不需要已安装 profile，
+也不碰网络与抓包 —— CI 上直接可跑。
 
 ## 文件结构
 
@@ -225,6 +233,7 @@ dsh-capture/
 ├── cordis.patch.yml
 ├── icon.svg
 ├── locale/{en,zh}.json
+├── types/index.d.ts     # 路由与工具的数据契约（纯类型）
 ├── lib/
 │   ├── index.js         # 入口：挂路由 + 注册 agent 工具 + Config
 │   ├── routes.js        # 13 条 HTTP 路由
@@ -238,8 +247,9 @@ dsh-capture/
 ├── client/client.js     # 设置页面板（纯 React + 主题 token）
 └── test/
     ├── selftest.mjs               # 解析器基础自测
-    ├── pcapng-idb.test.mjs        # IDB 偏移回归（真实形状，带 options）
-    └── stream-reassembly.test.mjs # TCP 重组 / HTTP 体 / TLS 详情（7 组）
+    ├── pcapng-idb.test.mjs        # IDB 偏移 + if_tsresol 回归
+    ├── stream-reassembly.test.mjs # TCP 重组 / HTTP 体 / TLS 详情（7 组）
+    └── routes.test.mjs            # 路由契约（23 项，无需已安装 profile）
 ```
 
 ## License

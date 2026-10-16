@@ -5,6 +5,44 @@
 > **状态说明**：本插件**未开发完成**，处于**测试阶段**。在 1.0.0 之前，
 > API、配置项与文件格式均可能在不通知的情况下变更。
 
+## [0.5.0] — 2026-10-16
+
+本版本补齐工程面与工具面：新增两个 agent 工具、类型声明、结构化日志、
+源码内路由契约测试，并把装机验证扩展到 45 项。
+
+### 新增
+
+- **`capture_status` 工具**：**不停止抓包**也能查看进度 —— 已落盘包数/字节、
+  抓包时长、后端与网卡，以及已捕获内容的轻量预览（DNS/SNI/TLS/HTTP 计数与
+  SNI 名单）。长抓包时用它轮询确认目标流量已进来，再 stop。
+  - 预览解析跳过重组以保持轮询廉价；仅在文件 ≤ 8 MB 时做
+  - pktmon 会话（ETL 尚未转换）也能报进度
+- **`capture_export` 工具**：把抓包导出成文件并返回路径，JSON/CSV 两种格式。
+  CSV 带 BOM 与 `time`/`tls` 列；JSON 含 meta/stats/reassembly/talkers/
+  DNS/SNI/HTTP/TLS。无浏览器也能拿到结构化产物。
+- **类型声明 `types/index.d.ts`**：8 个 interface 描述路由与工具的数据契约
+  （`CaptureEntry`/`InterfaceEntry`/`BackendReport`/`AnalyzeResult`/
+  `PacketRow`/`HttpTransaction`/`TlsInfo`/`ReassemblyStats`/`SearchResult`/
+  `CaptureConfig`），`package.json` 声明 `types` 与 `./types` 导出
+- **结构化日志**：`apply()` 通过 `ctx.logger` 记录加载/挂载/卸载与配置摘要；
+  host 没提供 logger 时自动降级为 no-op，绝不因日志缺失而抛错
+- **源码内路由契约测试** `test/routes.test.mjs`（**23 项**）：用假 host context
+  挂载真实路由并逐个调用 —— 注册数量、方法校验、id 校验、路径穿越防御、
+  跨包 HTTP 重组、时间戳 ISO、分页、导出 BOM、正则校验、dispose 清理。
+  不需要已安装 profile，可在 CI 裸跑
+
+### 变更
+
+- 装机验证 38 → **45 项**（新增：类型声明存在与覆盖、types 导出字段、
+  8 个 agent 工具齐备、ctx.logger 降级、pcap.js 关键实现存在）
+- README 与 package.json 的 meta 描述同步到 Npcap 优先的现状
+
+### 修复
+
+- **`/search` 的报文体检索失效**：0.4.0 把 `/analyze` 的 `streams` 拍平成摘要后，
+  search 仍按旧的嵌套形状取 `s.http.request?.bodyPreview`，导致 `bodies` 恒空。
+  现改为从 `transactions` 取。由新增的路由契约测试发现
+
 ## [0.4.0] — 2026-10-16
 
 本版本补上解析深度：**TCP 流重组**、**HTTP 报文体提取**、**TLS 握手详情**、

@@ -34,6 +34,7 @@ const FILES = [
   'cordis.patch.yml',
   'icon.svg',
   'README.md',
+  'types/index.d.ts',
   'locale/en.json',
   'locale/zh.json',
   'lib/index.js',

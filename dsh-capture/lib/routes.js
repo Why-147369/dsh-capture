@@ -575,16 +575,18 @@ export function mountRoutes(ctx, config) {
         sni: parsed.sni.filter((s) => hit(s.name)).slice(0, limit),
         http: parsed.http.filter((h) => hit(h.host) || hit(h.path) || hit(h.method)).slice(0, limit),
         endpoints: parsed.talkers.filter((t) => hit(t.src) || hit(t.dst)).slice(0, limit),
-        streams: parsed.streams.filter((s) => hit(s.key)
-          || (s.tls && hit(s.tls.sni))
-          || (s.http && (hit(s.http.request?.path) || hit(s.http.request?.host) || hit(s.http.response?.contentType)))).slice(0, limit),
-        // Bodies are searched too — that is the point of reassembly.
-        bodies: parsed.streams
-          .filter((s) => s.http && (hit(s.http.request?.bodyPreview) || hit(s.http.response?.bodyPreview)))
-          .map((s) => ({
-            stream: s.key,
-            requestBody: s.http.request?.bodyPreview ?? null,
-            responseBody: s.http.response?.bodyPreview ?? null,
+        streams: (parsed.streams || []).filter((s) => hit(s.key)
+          || hit(s.client) || hit(s.server)
+          || (s.http && (hit(s.http.request?.path) || hit(s.http.request?.host)))) .slice(0, limit),
+        // Bodies live on the flattened transaction view: reassembly is what
+        // makes them searchable at all.
+        bodies: (parsed.transactions || [])
+          .filter((t) => hit(t.requestBody) || hit(t.responseBody))
+          .map((t) => ({
+            stream: t.stream,
+            method: t.method, host: t.host, path: t.path,
+            requestBody: t.requestBody ?? null,
+            responseBody: t.responseBody ?? null,
           })).slice(0, limit),
       });
     })],

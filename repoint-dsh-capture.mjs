@@ -172,6 +172,7 @@ try {
   const sha = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex').slice(0, 12);
   const FILES = [
     'package.json', 'cordis.patch.yml', 'icon.svg', 'README.md',
+    'types/index.d.ts',
     'locale/en.json', 'locale/zh.json',
     'lib/index.js', 'lib/routes.js', 'lib/pcap.js', 'lib/pktmon.js', 'lib/tools.js',
     'lib/perm.js', 'lib/elevate.js', 'lib/npcap.js', 'lib/run-elevated.ps1',

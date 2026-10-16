@@ -421,6 +421,48 @@ try {
   check('disposeRoutes 清空注册', registered.size === 0, `before=${before} after=${registered.size}`);
 } catch (e) { check('disposeRoutes 清空注册', false, String(e.message)); }
 
+// ---- 7) 类型声明与 agent 工具注册面 ----
+{
+  const typesPath = path.join(INST, 'types', 'index.d.ts');
+  check('随包提供类型声明 types/index.d.ts', fs.existsSync(typesPath),
+    fs.existsSync(typesPath) ? `${(fs.statSync(typesPath).size / 1024).toFixed(1)} KB` : '缺失');
+  if (fs.existsSync(typesPath)) {
+    const dts = fs.readFileSync(typesPath, 'utf8');
+    const needed = ['CaptureEntry', 'InterfaceEntry', 'AnalyzeResult', 'PacketRow', 'HttpTransaction', 'TlsInfo', 'ReassemblyStats', 'CaptureConfig'];
+    const missing = needed.filter((n) => !new RegExp(`interface ${n}\\b`).test(dts));
+    check('类型声明覆盖关键契约（8 个 interface）', missing.length === 0,
+      missing.length ? `缺 ${missing.join(', ')}` : needed.join(', '));
+  }
+  const pkgJson = JSON.parse(fs.readFileSync(path.join(INST, 'package.json'), 'utf8'));
+  check('package.json 声明 types 字段与 types 导出',
+    pkgJson.types === './types/index.d.ts' && pkgJson.exports?.['./types'] === './types/index.d.ts',
+    `types=${pkgJson.types} exports=${pkgJson.exports?.['./types']}`);
+
+  // agent 工具注册面：源码里必须声明全部 8 个工具
+  const idxSrc = fs.readFileSync(path.join(INST, 'lib', 'index.js'), 'utf8');
+  const want = ['capture_probe', 'capture_list', 'capture_start', 'capture_stop',
+    'capture_analyze', 'capture_search', 'capture_status', 'capture_export'];
+  const missingTools = want.filter((w) => !idxSrc.includes(`name: '${w}'`));
+  check(`agent 工具齐备（${want.length} 个）`, missingTools.length === 0,
+    missingTools.length ? `缺 ${missingTools.join(', ')}` : want.join(', '));
+
+  check('接入 ctx.logger 且可降级（无 logger 时不抛）',
+    /makeLogger/.test(idxSrc) && /noop/.test(idxSrc),
+    'makeLogger + noop 回退');
+}
+
+// ---- 8) 源码级语法/契约快检（防回归） ----
+{
+  const pcapSrc = fs.readFileSync(path.join(INST, 'lib', 'pcap.js'), 'utf8');
+  check('pcap.js 含流重组与 TLS 详情实现',
+    /function buildStreams/.test(pcapSrc) && /function tlsClientHello/.test(pcapSrc)
+      && /function tlsServerHello/.test(pcapSrc) && /function reassembleDirection/.test(pcapSrc),
+    'buildStreams / tlsClientHello / tlsServerHello / reassembleDirection');
+  check('pcap.js 读取 if_tsresol（时间戳分辨率）',
+    /function readTsResolution/.test(pcapSrc) && /if_tsresol|tsResolutions/.test(pcapSrc),
+    'readTsResolution + tsResolutions');
+}
+
 say('');
 const passed = lines.filter((l) => l.startsWith('PASS')).length;
 say(failures === 0 ? `全部通过（${passed} 项）` : `${passed} 项通过，${failures} 项失败`);
