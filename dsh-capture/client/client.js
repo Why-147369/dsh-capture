@@ -420,6 +420,37 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'dshcap-tags' }, analysis.topPorts.slice(0, 16).map((p) => h('span', { key: p.port, className: 'dshcap-tag' }, `${p.port} (${p.count})`))),
               )
             : null,
+          analysis.transactions && analysis.transactions.length
+            ? h('div', { style: { marginTop: 8 } },
+                h('div', { className: 'dshcap-cell-label' }, `HTTP 事务（重组后，共 ${analysis.summary?.httpTransactions ?? analysis.transactions.length}）`),
+                h('div', { className: 'dshcap-list' },
+                  analysis.transactions.slice(0, 12).map((t, i) => h('div', { key: i, className: 'dshcap-mono' },
+                    `${t.method || '?'} ${t.host || ''}${t.path || ''}`.trim()
+                    + ` → ${t.status != null ? t.status : '?'}`
+                    + (t.responseBytes ? ` ${fmtBytes(t.responseBytes)}` : '')
+                    + (t.responseContentType ? ` ${String(t.responseContentType).split(';')[0]}` : ''),
+                  )),
+                ),
+              )
+            : null,
+          analysis.tls && analysis.tls.length
+            ? h('div', { style: { marginTop: 8 } },
+                h('div', { className: 'dshcap-cell-label' }, 'TLS 握手'),
+                h('div', { className: 'dshcap-list' },
+                  analysis.tls.slice(0, 10).map((t, i) => h('div', { key: i, className: 'dshcap-mono' },
+                    t.role === 'client'
+                      ? `ClientHello ${t.clientVersionName || '?'}${t.supportedVersions && t.supportedVersions.length ? ` → ${t.supportedVersions.join('/')}` : ''} | ${(t.cipherSuites || []).length} 套件${t.sni ? ` | ${t.sni}` : ''}`
+                      : `ServerHello ${t.negotiatedVersionName || '?'} | ${t.cipherSuite || '?'}`,
+                  )),
+                ),
+              )
+            : null,
+          analysis.reassembly
+            ? h('div', { className: 'dshcap-note', style: { marginTop: 8 } },
+                analysis.reassembly.disabled
+                  ? '流重组已关闭（config.reassemble=false）'
+                  : `流重组：${analysis.reassembly.streams} 条流 / ${fmtBytes(analysis.reassembly.reassembledBytes)} 重组字节 / 缺口 ${analysis.reassembly.gaps}`)
+            : null,
           analysis.stats && (analysis.stats.malformed || analysis.stats.truncated)
             ? h('div', { className: 'dshcap-note', style: { marginTop: 8 } }, `跳过畸形包 ${analysis.stats.malformed || 0}，截断 ${analysis.stats.truncated || 0}`)
             : null,
@@ -455,8 +486,10 @@ window.__ModuleLoader__.load({
             ),
             h('div', { className: 'dshcap-list', style: { marginTop: 6, maxHeight: 260 } },
               (packets.rows || []).map((r) => h('div', { key: r.index, className: 'dshcap-mono' },
-                `#${r.index} ${r.proto} ${r.src || '?'}${r.sport ? ':' + r.sport : ''} → ${r.dst || '?'}${r.dport ? ':' + r.dport : ''}`
+                `#${r.index} ${r.time ? r.time.replace('T', ' ').replace('Z', '') : (r.ts != null ? Number(r.ts).toFixed(3) : '')} `
+                + `${r.proto} ${r.src || '?'}${r.sport ? ':' + r.sport : ''} → ${r.dst || '?'}${r.dport ? ':' + r.dport : ''}`
                 + ` ${r.bytes}B`
+                + (r.tls ? ` ${r.tls}` : '')
                 + (r.sni ? ` SNI=${r.sni}` : '')
                 + (r.dns ? ` DNS=${r.dns.join(',')}` : '')
                 + (r.http ? ` ${r.http}` : ''),
@@ -466,8 +499,8 @@ window.__ModuleLoader__.load({
         ) : null,
 
         h('div', { className: 'dshcap-note' },
-          '分析在本地完成，不联网。抓包需要管理员权限：插件会在需要时请求一次 UAC 提权（可拒绝），'
-          + '无权限时仍可对已有 pcapng 做离线分析。',
+          '分析在本地完成，不联网。抓包优先走 Npcap（dumpcap，无需管理员）；'
+          + '无 Npcap 时回退 pktmon 并请求一次 UAC 提权（可拒绝），无权限时仍可对已有 pcapng 做离线分析。',
         ),
       );
     }

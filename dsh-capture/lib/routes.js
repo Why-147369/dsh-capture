@@ -19,7 +19,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
-import { parseCapture, DNS_TYPES } from './pcap.js';
+import { parseCapture, DNS_TYPES, isoTime } from './pcap.js';
 import { status } from './pktmon.js';
 import { probeEnvironment } from './perm.js';
 import { listInterfaces, pickDefaultInterface, invalidateInterfaceCache } from './npcap.js';
@@ -155,7 +155,7 @@ function guard(fn) {
  * @param {string} full
  * @returns {object}
  */
-function analyzeFile(full) {
+function analyzeFile(full, opts = {}) {
   const size = statSync(full).size;
   if (size > MAX_ANALYZE_BYTES) {
     return {
@@ -164,18 +164,43 @@ function analyzeFile(full) {
     };
   }
   const buf = readFileSync(full);
-  const parsed = parseCapture(buf, { maxPackets: MAX_ANALYZE_PACKETS });
-  const { packets, ...rest } = parsed;
+  const parsed = parseCapture(buf, { maxPackets: MAX_ANALYZE_PACKETS, ...opts });
+  const { packets, streams, ...rest } = parsed;
   // Packets themselves are large; return counts and only a small head sample.
   return {
     ok: true,
     file: basename(full),
     sizeBytes: size,
     ...rest,
+    // Flattened HTTP request/response pairs — this is what the panel renders.
+    transactions: (rest.httpTransactions || []).map((t) => ({
+      ts: t.ts, time: isoTime(t.ts), stream: t.stream,
+      client: t.client, server: t.server,
+      method: t.method, path: t.path, host: t.host,
+      status: t.status, reason: t.reason,
+      requestContentType: t.requestContentType,
+      responseContentType: t.responseContentType,
+      responseBytes: t.responseBytes,
+      requestBody: t.requestBody,
+      responseBody: t.responseBody,
+      responseBodyTruncated: t.responseBodyTruncated,
+    })),
+    // Nested per-stream view (reassembly details) stays available for tools.
+    streams: (streams || []).map((s) => ({
+      key: s.key, client: s.client, server: s.server,
+      packets: s.packets, bytes: s.bytes, gaps: s.gaps, truncated: s.truncated,
+      firstTime: isoTime(s.firstTs),
+      hasHttp: !!s.http, hasTls: !!s.tls,
+    })),
     headSample: packets.slice(0, 40).map((p) => ({
-      ts: p.ts, proto: p.proto, src: p.src, dst: p.dst,
+      ts: p.ts,
+      time: isoTime(p.ts),
+      proto: p.proto, src: p.src, dst: p.dst,
       sport: p.sport ?? null, dport: p.dport ?? null,
       bytes: p.bytes ?? 0, sni: p.sni ?? null,
+      tls: p.tls ? (p.tls.role === 'client'
+        ? `ClientHello ${p.tls.clientVersionName || ''} suites=${(p.tls.cipherSuites || []).length}`
+        : `ServerHello ${p.tls.negotiatedVersionName || ''} ${p.tls.cipherSuite || ''}`) : null,
       dns: p.dns ? p.dns.queries.map((q) => `${q.name}/${DNS_TYPES[q.type] || q.type}`).join(',') : null,
       http: p.http ? (p.http.method ? `${p.http.method} ${p.http.path}` : `HTTP ${p.http.status}`) : null,
     })),
@@ -195,6 +220,17 @@ export function mountRoutes(ctx, config) {
     defaultPktSize: Number(config?.defaultPktSize) > 0 ? Number(config.defaultPktSize) : 256,
     useElevation: config?.useElevation !== false,
     allowDownload: config?.allowDownload !== false,
+    reassemble: config?.reassemble !== false,
+    streamCapKb: Number(config?.streamCapKb) > 0 ? Number(config.streamCapKb) : 256,
+    maxStreams: Number(config?.maxStreams) > 0 ? Number(config.maxStreams) : 2000,
+    httpBodyPreviewBytes: Number(config?.httpBodyPreviewBytes) >= 0 ? Number(config.httpBodyPreviewBytes) : 4096,
+  };
+  /** Reassembly knobs handed to parseCapture. */
+  const parseOpts = {
+    reassemble: cfg.reassemble,
+    streamCap: Math.max(4096, cfg.streamCapKb * 1024),
+    maxStreams: cfg.maxStreams,
+    bodyCap: cfg.httpBodyPreviewBytes,
   };
   const disposers = [];
   const dir = captureDir();
@@ -295,25 +331,60 @@ export function mountRoutes(ctx, config) {
       }
       const full = resolveId(id);
       if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件（id 无效或已被删除）。' }); return; }
-      json(res, 200, analyzeFile(full));
+      json(res, 200, analyzeFile(full, parseOpts));
     })],
 
     ['/dsh-capture/flows', ['GET'], guard(async (req, res) => {
       const url = new URL(req.url, 'http://127.0.0.1');
       const full = resolveId(url.searchParams.get('id') || '');
       if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件。' }); return; }
-      const parsed = analyzeFile(full);
+      const parsed = analyzeFile(full, parseOpts);
       if (!parsed.ok) { json(res, 400, parsed); return; }
       const q = (url.searchParams.get('q') || '').toLowerCase();
       const filterFn = (s) => !q || String(s).toLowerCase().includes(q);
       json(res, 200, {
         ok: true,
         meta: parsed.meta,
+        reassembly: parsed.reassembly,
         talkers: parsed.talkers.filter((t) => filterFn(t.src) || filterFn(t.dst)),
         topPorts: parsed.topPorts,
         dns: parsed.dns.filter((d) => filterFn(d.name)).slice(0, 500),
         sni: parsed.sni.filter((s) => filterFn(s.name)),
         http: parsed.http.filter((h) => filterFn(h.host || '') || filterFn(h.path || '')).slice(0, 300),
+        // Reassembled streams: request/response pairs plus TLS handshake facts.
+        streams: parsed.streams
+          .filter((s) => !q
+            || filterFn(s.client) || filterFn(s.server)
+            || (s.http && (filterFn(s.http.request?.host) || filterFn(s.http.request?.path)))
+            || (s.tls && filterFn(s.tls.sni)))
+          .map((s) => ({
+            key: s.key, client: s.client, server: s.server,
+            packets: s.packets, bytes: s.bytes, gaps: s.gaps, truncated: s.truncated,
+            firstTs: s.firstTs, firstTime: isoTime(s.firstTs),
+            requestBytes: s.requestBytes, responseBytes: s.responseBytes,
+            http: s.http ? {
+              method: s.http.request?.method ?? null,
+              path: s.http.request?.path ?? null,
+              host: s.http.request?.host ?? null,
+              status: s.http.response?.status ?? null,
+              requestContentType: s.http.request?.contentType ?? null,
+              responseContentType: s.http.response?.contentType ?? null,
+              responseContentLength: s.http.response?.contentLength ?? null,
+              requestBody: s.http.request?.bodyPreview ?? null,
+              responseBody: s.http.response?.bodyPreview ?? null,
+              responseBodyTruncated: s.http.response?.bodyTruncated ?? false,
+            } : null,
+            tls: s.tls ? {
+              role: s.tls.role, sni: s.tls.sni ?? null,
+              clientVersionName: s.tls.clientVersionName ?? null,
+              recordVersionName: s.tls.recordVersionName ?? null,
+              supportedVersions: s.tls.supportedVersions ?? null,
+              cipherSuites: s.tls.cipherSuites ?? null,
+              negotiatedVersionName: s.tls.negotiatedVersionName ?? null,
+              cipherSuite: s.tls.cipherSuite ?? null,
+            } : null,
+          })),
+        tlsHandshakes: parsed.tls.filter((t) => !q || filterFn(t.sni) || filterFn(t.src) || filterFn(t.dst)).slice(0, 300),
       });
     })],
 
@@ -361,7 +432,7 @@ export function mountRoutes(ctx, config) {
       const url = new URL(req.url, 'http://127.0.0.1');
       const full = resolveId(url.searchParams.get('id') || '');
       if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件。' }); return; }
-      const parsed = analyzeFile(full);
+      const parsed = analyzeFile(full, parseOpts);
       if (!parsed.ok) { json(res, 400, parsed); return; }
 
       const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
@@ -372,19 +443,25 @@ export function mountRoutes(ctx, config) {
       const q = (url.searchParams.get('q') || '').toLowerCase();
 
       // Re-parse just for the packet rows; analyzeFile intentionally returns
-      // only a head sample to keep the summary small.
+      // only a head sample to keep the summary small. Reassembly is skipped
+      // here — the row view only needs per-packet facts.
       const raw = readFileSync(full);
-      const all = parseCapture(raw, { maxPackets: MAX_ANALYZE_PACKETS });
+      const all = parseCapture(raw, { maxPackets: MAX_ANALYZE_PACKETS, reassemble: false });
       let rows = all.packets.map((p, index) => ({
         index,
         ts: p.ts,
+        time: isoTime(p.ts),
         proto: p.proto,
         src: p.src ?? null,
         dst: p.dst ?? null,
         sport: p.sport ?? null,
         dport: p.dport ?? null,
         bytes: p.bytes ?? 0,
+        payloadBytes: p.payloadLen ?? 0,
         sni: p.sni ?? null,
+        tls: p.tls ? (p.tls.role === 'client'
+          ? `ClientHello ${p.tls.clientVersionName || ''}`
+          : `ServerHello ${p.tls.negotiatedVersionName || ''} ${p.tls.cipherSuite || ''}`.trim()) : null,
         dns: p.dns ? p.dns.queries.map((x) => x.name) : null,
         http: p.http ? (p.http.method ? `${p.http.method} ${p.http.path}` : `HTTP ${p.http.status}`) : null,
         flags: p.flags ?? null,
@@ -411,7 +488,7 @@ export function mountRoutes(ctx, config) {
       if (!full) { json(res, 404, { ok: false, error: '未找到该抓包文件。' }); return; }
       const format = (url.searchParams.get('format') || 'csv').toLowerCase();
       const raw = readFileSync(full);
-      const parsed = parseCapture(raw, { maxPackets: MAX_ANALYZE_PACKETS });
+      const parsed = parseCapture(raw, { maxPackets: MAX_ANALYZE_PACKETS, reassemble: false });
       const base = basename(full).replace(/\.[^.]+$/, '');
 
       if (format === 'csv') {
@@ -419,13 +496,16 @@ export function mountRoutes(ctx, config) {
           const s = v === null || v === undefined ? '' : String(v);
           return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
         };
-        const head = ['index', 'ts', 'proto', 'src', 'dst', 'sport', 'dport', 'bytes', 'sni', 'dns', 'http'];
+        const head = ['index', 'time', 'ts', 'proto', 'src', 'dst', 'sport', 'dport', 'bytes', 'sni', 'tls', 'dns', 'http'];
         const lines = [head.join(',')];
         parsed.packets.forEach((p, i) => {
           lines.push([
-            i, p.ts ?? '', p.proto ?? '', p.src ?? '', p.dst ?? '',
+            i, isoTime(p.ts) ?? '', p.ts ?? '', p.proto ?? '', p.src ?? '', p.dst ?? '',
             p.sport ?? '', p.dport ?? '', p.bytes ?? '',
             p.sni ?? '',
+            p.tls ? (p.tls.role === 'client'
+              ? `ClientHello ${p.tls.clientVersionName || ''} suites=${(p.tls.cipherSuites || []).length}`
+              : `ServerHello ${p.tls.negotiatedVersionName || ''} ${p.tls.cipherSuite || ''}`) : '',
             p.dns ? p.dns.queries.map((x) => x.name).join(' ') : '',
             p.http ? (p.http.method ? `${p.http.method} ${p.http.path}` : `HTTP ${p.http.status}`) : '',
           ].map(esc).join(','));
@@ -446,11 +526,15 @@ export function mountRoutes(ctx, config) {
           file: basename(full),
           meta: parsed.meta,
           stats: parsed.stats,
+          reassembly: parsed.reassembly,
           talkers: parsed.talkers,
           topPorts: parsed.topPorts,
           dns: parsed.dns.map((d) => ({ ...d, type: DNS_TYPES[d.type] || String(d.type) })),
           sni: parsed.sni,
           http: parsed.http,
+          tls: parsed.tls,
+          streams: parsed.streams,
+          httpTransactions: parsed.httpTransactions,
         }, null, 2);
         res.writeHead(200, {
           'content-type': 'application/json; charset=utf-8',
@@ -480,7 +564,7 @@ export function mountRoutes(ctx, config) {
       try { re = new RegExp(pattern, 'i'); }
       catch (e) { json(res, 400, { ok: false, error: `正则无效：${e.message}` }); return; }
 
-      const parsed = analyzeFile(full);
+      const parsed = analyzeFile(full, parseOpts);
       if (!parsed.ok) { json(res, 400, parsed); return; }
       const limit = Math.min(300, Math.max(1, Number(url.searchParams.get('limit')) || 100));
       const hit = (s) => re.test(String(s ?? ''));
@@ -491,6 +575,17 @@ export function mountRoutes(ctx, config) {
         sni: parsed.sni.filter((s) => hit(s.name)).slice(0, limit),
         http: parsed.http.filter((h) => hit(h.host) || hit(h.path) || hit(h.method)).slice(0, limit),
         endpoints: parsed.talkers.filter((t) => hit(t.src) || hit(t.dst)).slice(0, limit),
+        streams: parsed.streams.filter((s) => hit(s.key)
+          || (s.tls && hit(s.tls.sni))
+          || (s.http && (hit(s.http.request?.path) || hit(s.http.request?.host) || hit(s.http.response?.contentType)))).slice(0, limit),
+        // Bodies are searched too — that is the point of reassembly.
+        bodies: parsed.streams
+          .filter((s) => s.http && (hit(s.http.request?.bodyPreview) || hit(s.http.response?.bodyPreview)))
+          .map((s) => ({
+            stream: s.key,
+            requestBody: s.http.request?.bodyPreview ?? null,
+            responseBody: s.http.response?.bodyPreview ?? null,
+          })).slice(0, limit),
       });
     })],
   ];

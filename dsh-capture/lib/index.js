@@ -20,7 +20,7 @@
 import { readFileSync, statSync } from 'node:fs';
 import { basename } from 'node:path';
 import z from '@deepseek-ai/schemastery';
-import { parseCapture, DNS_TYPES } from './pcap.js';
+import { parseCapture, DNS_TYPES, isoTime } from './pcap.js';
 import { mountRoutes } from './routes.js';
 import { clearFilters } from './pktmon.js';
 import { probeEnvironment } from './perm.js';
@@ -54,6 +54,14 @@ export const Config = z.object({
   defaultPktSize: z.number().step(1).min(64).default(256),
   /** Allow the download route to return raw capture bytes. */
   allowDownload: z.boolean().default(true),
+  /** Reassemble TCP streams (needed for split HTTP messages and TLS details). */
+  reassemble: z.boolean().default(true),
+  /** Retained bytes per stream direction, in KB. */
+  streamCapKb: z.number().step(1).min(4).default(256),
+  /** Max TCP streams reassembled per analysis call. */
+  maxStreams: z.number().step(1).min(1).default(2000),
+  /** Preview cap for HTTP request/response bodies, in bytes. */
+  httpBodyPreviewBytes: z.number().step(1).min(0).default(4096),
 });
 
 const DEFAULTS = {
@@ -62,6 +70,10 @@ const DEFAULTS = {
   useElevation: true,
   defaultPktSize: 256,
   allowDownload: true,
+  reassemble: true,
+  streamCapKb: 256,
+  maxStreams: 2000,
+  httpBodyPreviewBytes: 4096,
 };
 
 /**
@@ -99,6 +111,20 @@ function readConfig(config) {
     useElevation: readConfigValue(config, 'useElevation'),
     defaultPktSize: readConfigValue(config, 'defaultPktSize'),
     allowDownload: readConfigValue(config, 'allowDownload'),
+    reassemble: readConfigValue(config, 'reassemble'),
+    streamCapKb: readConfigValue(config, 'streamCapKb'),
+    maxStreams: readConfigValue(config, 'maxStreams'),
+    httpBodyPreviewBytes: readConfigValue(config, 'httpBodyPreviewBytes'),
+  };
+}
+
+/** Reassembly knobs derived from the normalized config. */
+function parseOptsFrom(cfg) {
+  return {
+    reassemble: cfg.reassemble !== false,
+    streamCap: Math.max(4096, (Number(cfg.streamCapKb) || 256) * 1024),
+    maxStreams: Number(cfg.maxStreams) || 2000,
+    bodyCap: Number(cfg.httpBodyPreviewBytes) >= 0 ? Number(cfg.httpBodyPreviewBytes) : 4096,
   };
 }
 
@@ -335,7 +361,7 @@ function registerTools(ctx, cfg) {
   add({
     name: 'capture_analyze',
     description:
-      '解析一个已保存的抓包（id 来自 capture_list），返回流量摘要：包/字节数、时间范围、Top 会话、Top 端口、DNS 查询、TLS SNI 主机名、明文 HTTP 请求。这是理解抓包内容的主要工具。',
+      '解析一个已保存的抓包（id 来自 capture_list），返回流量摘要：包/字节数、时间范围、Top 会话、Top 端口、DNS 查询、TLS 握手（SNI/版本/密码套件）、明文 HTTP 请求，以及重组后的 TCP 流与 HTTP 请求/响应配对（含报文体预览）。这是理解抓包内容的主要工具。',
     parameters: {
       id: { type: 'string', required: true, description: 'capture_list 返回的抓包 id。' },
       topN: { type: 'integer', description: '返回的会话/端口条数，默认 20，最大 100。' },
@@ -353,11 +379,22 @@ function registerTools(ctx, cfg) {
         const lines = [
           `文件 ${value.file} | ${(value.sizeBytes / 1024).toFixed(1)} KB | 包 ${m.packets} | 字节 ${m.bytes}`,
           `TCP ${m.tcpPackets ?? 0} / UDP ${m.udpPackets ?? 0}`,
+          `时间范围 ${m.firstTime ?? '—'} → ${m.lastTime ?? '—'}`,
           `DNS 名称 ${value.summary?.dnsNames ?? 0} | TLS 主机 ${value.summary?.httpsHosts ?? 0} | HTTP 请求 ${value.summary?.httpRequests ?? 0} | 端点 ${value.summary?.endpoints ?? 0}`,
+          `TCP 流 ${value.summary?.tcpStreams ?? 0} | HTTP 事务 ${value.summary?.httpTransactions ?? 0} | TLS 握手 ${value.summary?.tlsHandshakes ?? 0}`,
         ];
         if (value.sni?.length) lines.push('TLS SNI: ' + value.sni.slice(0, 10).map((s) => `${s.name}(${s.count})`).join(', '));
+        const tlsDetails = (value.tls || []).filter((t) => t.cipherSuite).slice(0, 3);
+        if (tlsDetails.length) lines.push('TLS 协商: ' + tlsDetails.map((t) => `${t.negotiatedVersionName || t.clientVersionName || '?'}/${t.cipherSuite}`).join(', '));
         if (value.dns?.length) lines.push('DNS: ' + value.dns.slice(0, 10).map((d) => `${d.name}/${d.type}`).join(', '));
         if (value.talkers?.length) lines.push('Top 会话: ' + value.talkers.slice(0, 5).map((t) => `${t.src}->${t.dst}(${t.bytes}B)`).join(', '));
+        const tx = (value.streams || []).filter((s) => s.method || s.status).slice(0, 5);
+        if (tx.length) {
+          lines.push('HTTP 事务（重组后）:');
+          for (const t of tx) {
+            lines.push(`  ${t.method ?? '?'} ${t.host ?? ''}${t.path ?? ''} → ${t.status ?? '?'}${t.responseBytes ? ` (${t.responseBytes}B)` : ''}`);
+          }
+        }
         if (value.stats?.malformed) lines.push(`跳过畸形包 ${value.stats.malformed}，截断 ${value.stats.truncated ?? 0}`);
         return [{ type: 'text', text: lines.join('\n') }];
       },
@@ -373,7 +410,7 @@ function registerTools(ctx, cfg) {
   add({
     name: 'capture_search',
     description:
-      '在一个抓包里按关键词检索：匹配 DNS 查询名、TLS SNI 主机名、HTTP 主机/路径，以及包含该关键词的 IP 端点。用于回答「这次会话有没有连过 X」。',
+      '在一个抓包里按关键词检索：匹配 DNS 查询名、TLS SNI 主机名与协商套件、HTTP 主机/路径，以及包含该关键词的 IP 端点；同时会搜索重组后的 HTTP 报文体。用于回答「这次会话有没有连过 X」或「哪个请求带了这个字段」。',
     parameters: {
       id: { type: 'string', required: true, description: 'capture_list 返回的抓包 id。' },
       query: { type: 'string', required: true, description: '大小写不敏感的子串关键词。' },
@@ -445,26 +482,34 @@ function analyzeBounded(full, topN, cfg) {
       sizeBytes: st.size,
     };
   }
-  const parsed = parseCapture(readFileSync(full), { maxPackets: maxPacketsFrom(cfg) });
-  const { packets, http, dns, sni, talkers, topPorts, meta, stats } = parsed;
+  const parsed = parseCapture(readFileSync(full), { maxPackets: maxPacketsFrom(cfg), ...parseOptsFrom(cfg) });
+  const { packets, http, dns, sni, talkers, topPorts, meta, stats, tls, streams, httpTransactions, reassembly } = parsed;
   return {
     ok: true,
     file: basename(full),
     sizeBytes: st.size,
     meta,
     stats,
+    reassembly,
     talkers: talkers.slice(0, topN),
     topPorts: topPorts.slice(0, topN),
     dns: dns.slice(0, topN * 4).map((d) => ({ ...d, type: DNS_TYPES[d.type] || String(d.type) })),
     sni: sni.slice(0, topN),
     http: http.slice(0, topN),
+    tls: (tls || []).slice(0, topN),
+    // Reassembled request/response pairs, including extracted bodies.
+    streams: (httpTransactions || []).slice(0, topN),
+    streamCount: (streams || []).length,
     summary: {
       dnsNames: [...new Set(dns.map((d) => d.name))].length,
       httpsHosts: [...new Set(sni.map((s) => s.name))].length,
       httpRequests: http.length,
+      httpTransactions: (httpTransactions || []).length,
+      tlsHandshakes: (tls || []).length,
+      tcpStreams: (streams || []).length,
       endpoints: [...new Set([...talkers.map((t) => t.src), ...talkers.map((t) => t.dst)])].length,
       packetSample: packets.slice(0, 20).map((p) => ({
-        proto: p.proto, src: p.src, dst: p.dst,
+        time: isoTime(p.ts), proto: p.proto, src: p.src, dst: p.dst,
         sport: p.sport ?? null, dport: p.dport ?? null, bytes: p.bytes ?? 0,
       })),
     },
@@ -495,5 +540,10 @@ function searchCapture(full, q, limit, cfg) {
       .slice(0, limit)
       .map((t) => ({ src: t.src, dst: t.dst, packets: t.packets, bytes: t.bytes })),
     ports: parsed.topPorts.filter((p) => hit(String(p.port))).slice(0, limit),
+    // Reassembled view: hits inside HTTP bodies are only findable because the
+    // stream was reassembled first.
+    tls: (parsed.tls || []).filter((t) => hit(t.sni) || hit(t.src) || hit(t.dst) || hit(t.cipherSuite)).slice(0, limit),
+    transactions: (parsed.streams || []).filter((s) => hit(s.host) || hit(s.path) || hit(s.method)
+      || hit(s.requestBody) || hit(s.responseBody)).slice(0, limit),
   };
 }

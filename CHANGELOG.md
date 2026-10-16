@@ -5,6 +5,60 @@
 > **状态说明**：本插件**未开发完成**，处于**测试阶段**。在 1.0.0 之前，
 > API、配置项与文件格式均可能在不通知的情况下变更。
 
+## [0.4.0] — 2026-10-16
+
+本版本补上解析深度：**TCP 流重组**、**HTTP 报文体提取**、**TLS 握手详情**、
+**人类可读时间戳**。此前跨包的 HTTP 消息只能看到首包，TLS 只能拿到 SNI。
+
+### 新增
+
+- **TCP 流重组**（`lib/pcap.js` 的 `buildStreams`）
+  - 按 4 元组（规范化端点对）分组，每方向独立重组
+  - 片段按 **seq 排序**，并处理 2^32 回绕：偏移以首个片段为基准取模，
+    落在模空间"负半区"的片段判为更早到达 —— **乱序捕获也能拼对**
+  - 重叠去重、空洞计数（`gaps`）、越界截断标记（`truncated`）
+  - 自动识别客户端方向：优先看哪一侧先发 HTTP 请求行或 ClientHello
+- **HTTP 事务提取**：把重组后的双向缓冲配对成一次请求/响应
+  - 请求：方法、路径、Host、User-Agent、Content-Type、Content-Length、**请求体预览**
+  - 响应：状态码、reason、Content-Type、Content-Length、Server、**响应体预览**
+  - 只有文本类型（`text/*`、`application/json|xml|…`）才取体，二进制体只记长度
+  - `Transfer-Encoding: chunked` 会标记出来，但不还原分块体（见已知问题）
+- **TLS 握手详情**（`tlsClientHello` / `tlsServerHello`）
+  - ClientHello：记录层版本、客户端版本、`supported_versions` 列表、
+    **密码套件清单（带规范名）**、扩展列表、SNI
+  - ServerHello：协商版本（含从 `supported_versions` 扩展取 TLS 1.3 真版本）与协商套件
+  - 全部读取带边界检查，snaplen 截断的包不会抛异常
+- **时间戳**：`meta.firstTime` / `lastTime`、包行 `time`、CSV 新增 `time` 列（ISO-8601 UTC）
+- **配置项**：`reassemble`、`streamCapKb`、`maxStreams`、`httpBodyPreviewBytes`
+- **面板**：新增「HTTP 事务（重组后）」与「TLS 握手」两块，包列表显示时间；
+  底注改为与实测一致的「Npcap 免管理员」
+- **测试**：`test/stream-reassembly.test.mjs` 共 7 组（跨包 HTTP、乱序、缺口、
+  ClientHello、ServerHello、时间戳、上限与开关）
+- **脚本**：`repoint-dsh-capture.mjs`（修正 profile 依赖指向）、`recheck-22.mjs`（完成度复核）
+
+### 变更
+
+- `parseCapture(buf, opts)` 的 `opts` 现在真正透传到 pcap / pcapng 解析器
+  （此前只吃 `maxPackets`，`streamCap` 等被静默忽略）
+- `/dsh-capture/flows` 增加 `streams` 与 `tlsHandshakes`；`/analyze` 增加
+  `transactions`（拍平的 HTTP 事务）、`tls`、`reassembly`
+- `/dsh-capture/search` 增加 `tls`、`streams`、`bodies` 命中类别
+- 包行增加 `payloadBytes`（TCP 载荷长度，`bytes` 是整帧长度）
+- 装机验证 29 → **38 项**
+
+### 修复
+
+- `parseOptsFrom(cfg)` 未生效的问题：现在 `reassemble:false` 等配置真正影响到解析
+- CSV 表头增加 `time` 与 `tls` 列后，装机验证的断言同步更新
+
+### 已知问题（未修复）
+
+- **TLS 不解密**：只解析明文握手，应用数据是密文；解密需要 SSLKEYLOGFILE 或私钥
+- **HTTP/2、HTTP/3 未解析**：只识别 HTTP/1.x 文本协议
+- **chunked 响应体未拼接**
+- 大文件仍未流式解析（整文件读入，默认上限 96 MB）
+- pktmon + 提权助手路径仍未经真机验证
+
 ## [0.3.0] — 2026-10-16
 
 本版本接入 Npcap 后端，**并更正了 0.1.0 起一直存在的错误结论**：「抓包需要管理员权限」。

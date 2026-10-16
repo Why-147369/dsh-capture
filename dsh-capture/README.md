@@ -39,15 +39,19 @@
 - **BPF 过滤**：Npcap 后端支持完整 libpcap 表达式，如 `tcp port 443 and host 1.1.1.1`
 - **网卡选择**：自动识别真实网卡（WLAN / 以太网），跳过 VMware / 环回 / 空闲虚拟适配器
 - **离线解析**：自研 pcapng / pcap 解析器，零外部依赖
+- **TCP 流重组**：按 4 元组分组、按 seq 排序、检测缺口与重传，跨包消息能完整读出
+- **HTTP 事务**：从重组流里配对请求/响应，提取方法、路径、Host、状态码、Content-Type、Content-Length 与**报文体预览**
+- **TLS 握手详情**：SNI、记录层版本、客户端版本、`supported_versions`、**密码套件清单**（ClientHello）；协商版本与套件（ServerHello）
 - **流量提取**：Ethernet / IPv4 / IPv6 / TCP / UDP / ICMP / ARP，以及
   - DNS 查询（A / AAAA / CNAME / HTTPS …）
-  - TLS SNI 主机名（从 ClientHello 解析）
+  - TLS SNI 与握手参数
   - 明文 HTTP/1.x 请求行与响应状态
   - Top 会话、Top 端口、端点数
+- **时间戳**：包行与摘要都带 ISO-8601 UTC 时间
 - **包级浏览**：分页读取单个数据包，支持协议 / 端口 / 主机 / 关键词过滤
-- **结构化导出**：CSV（带 BOM，Excel 直接可读）与 JSON 摘要
+- **结构化导出**：CSV（带 BOM，Excel 直接可读）与 JSON 摘要（含流与 HTTP 事务）
 - **6 个 agent 工具**：让模型自己抓包并读懂流量
-- **设置页面板**：后端状态、网卡选择、BPF 输入、抓包列表、包浏览、导出
+- **设置页面板**：后端状态、网卡选择、BPF 输入、抓包列表、包浏览、HTTP 事务、TLS 握手、导出
 
 ## 当前状态
 
@@ -64,19 +68,22 @@
 - 抓包成败按 **EPB 数据块数**判定（文件体积不可靠：合法零包文件也可能有 484 字节）
 - 解析器：真实 dumpcap 产出解析正确（164 / 100 / 83 包，SNI 与 DNS 均命中）
 - 解析器回归测试：带 options 的真实形状 IDB、linkType=0 容错、多包完整解析
+- **TCP 重组回归测试（7 组）**：跨包 HTTP 请求/响应完整读出、乱序片段按 seq 排序、
+  缺口检出、ClientHello 版本与套件、ServerHello 协商结果、ISO 时间、上限约束与开关
 - 方法校验（`GET /start` → 405）、无效 id → 404、路径穿越 id → 404
 - 包级浏览分页与协议/端口过滤、CSV/JSON 导出、正则检索（无效正则返 400）
 - Client bundle 契约、slot 注册（`settings.section`）、图标与 manifest 契约
-- 装机验证共 **29 项**、端到端 **9 项**，全部通过
+- 装机验证共 **38 项**、解析器/重组单元测试 **3 组全过**、端到端 **9 项**
 
 ### 未验证 / 已知问题 ⚠️
 
 - **pktmon + 提权助手路径未在真机跑通**：本机有 Npcap，后端自动选了它，
   因此 `run-elevated.ps1` 的 UAC 全链（提权 → 抓包 → 停止 → 转换 → 分析）
   与 UAC 拒绝分支都**未经真机验证**
-- **TCP 流重组未实现**：HTTP 长响应跨包时会截断，只能看到首包
-- **HTTP 报文体重组未实现**：只提取请求行/状态行与 Host 头
-- **TLS 只提取 SNI**：未导出握手版本与密码套件
+- **TLS 不解密**：只解析明文握手（ClientHello / ServerHello）。应用数据是密文，
+  要解密需要 SSLKEYLOGFILE 或私钥 —— 尚未支持
+- **HTTP/2 与 HTTP/3 未解析**：只识别 HTTP/1.x 文本协议
+- **chunked 响应体未拼接**：`Transfer-Encoding: chunked` 只记录头部，不还原分块体
 - 大文件未做流式解析（整文件读入，默认上限 96 MB）
 - 抓包文件无自动清理策略（Npcap 后端支持 `ringFileMb` 回绕，但旧文件需手动删）
 - 设置页 UI 的深浅主题适配仅按 token 规则编写，未在真实页面逐项核对
@@ -133,6 +140,10 @@ reg add "HKLM\SOFTWARE\WOW6432Node\Npcap" /v AdminOnly /t REG_DWORD /d 0 /f
     useElevation: true           # 非提权时是否经 UAC 委托抓包；无人值守可设 false
     defaultPktSize: 256          # 默认每包截取字节数 64..262144
     allowDownload: true          # 是否允许 /download 返回原始抓包字节
+    reassemble: true             # 是否做 TCP 流重组（关掉可省内存，但跨包 HTTP/TLS 读不全）
+    streamCapKb: 256             # 每个方向保留的重组字节上限（KB）
+    maxStreams: 2000             # 单次分析最多重组的 TCP 流数
+    httpBodyPreviewBytes: 4096   # HTTP 报文体预览上限（字节，0 = 不取体）
 ```
 
 ## Agent 工具
@@ -143,8 +154,8 @@ reg add "HKLM\SOFTWARE\WOW6432Node\Npcap" /v AdminOnly /t REG_DWORD /d 0 /f
 | `capture_list` | 列出已保存抓包，返回寻址用 id 与**包数** |
 | `capture_start` | 开始抓包。支持 `device`（网卡）、`bpf`（原始 libpcap 表达式）、`filters`（结构化）、`snaplen`、`durationSec`、`ringFileMb` |
 | `capture_stop` | 停止并返回包数（Npcap 直接停；pktmon 转 pcapng） |
-| `capture_analyze` | 解析抓包 → 流量摘要（会话/端口/DNS/SNI/HTTP） |
-| `capture_search` | 在抓包里按关键词检索（"有没有连过 X"） |
+| `capture_analyze` | 解析抓包 → 摘要（会话/端口/DNS/**TLS 握手**/HTTP）＋ **重组后的 TCP 流与 HTTP 请求/响应配对（含报文体）** |
+| `capture_search` | 在抓包里按关键词检索，**包含重组后的 HTTP 报文体**（"有没有连过 X"／"哪个请求带了这个字段"） |
 
 典型用法：
 
@@ -153,8 +164,8 @@ reg add "HKLM\SOFTWARE\WOW6432Node\Npcap" /v AdminOnly /t REG_DWORD /d 0 /f
 2. capture_start {bpf:"tcp port 443"}         → 只抓 HTTPS，文件小
 3. （复现目标操作）
 4. capture_stop                               → 拿到 id 与包数
-5. capture_analyze {id, topN:30}              → 看流量摘要
-6. capture_search {id, query:"api.xxx"}       → 确认是否访问过某域名
+5. capture_analyze {id, topN:30}              → 看流量摘要 + HTTP 事务 + TLS 握手
+6. capture_search {id, query:"api.xxx"}       → 确认是否访问过某域名/某字段
 ```
 
 ## HTTP 路由
@@ -166,11 +177,11 @@ reg add "HKLM\SOFTWARE\WOW6432Node\Npcap" /v AdminOnly /t REG_DWORD /d 0 /f
 | `/dsh-capture/sessions` | GET | 已保存抓包列表（含包数） |
 | `/dsh-capture/start` | POST | 开始抓包（自动选后端；pktmon 需提权时返回 403 + 说明） |
 | `/dsh-capture/stop` | POST | 停止并返回包数 |
-| `/dsh-capture/analyze` | GET/POST | 解析摘要 |
-| `/dsh-capture/flows` | GET | 会话/端口/DNS/SNI/HTTP，支持 `q=` 过滤 |
-| `/dsh-capture/packets` | GET | **包级浏览**：`offset`/`limit`/`proto`/`port`/`host`/`q` |
-| `/dsh-capture/export` | GET | **结构化导出**：`format=csv\|json` |
-| `/dsh-capture/search` | GET | **正则检索**：`pattern=`（长度上限 200） |
+| `/dsh-capture/analyze` | GET/POST | 解析摘要 + `transactions`（HTTP 事务）+ `tls` + `reassembly` |
+| `/dsh-capture/flows` | GET | 会话/端口/DNS/SNI/HTTP，**`streams`（重组流）与 `tlsHandshakes`**，支持 `q=` 过滤 |
+| `/dsh-capture/packets` | GET | **包级浏览**：`offset`/`limit`/`proto`/`port`/`host`/`q`；每行带 `time`（ISO） |
+| `/dsh-capture/export` | GET | **结构化导出**：`format=csv\|json`（CSV 含 `time`/`tls` 列） |
+| `/dsh-capture/search` | GET | **正则检索**：`pattern=`（长度上限 200），含 `bodies`（报文体命中） |
 | `/dsh-capture/download` | GET | 下载 pcapng（受 `allowDownload` 控制） |
 | `/dsh-capture/delete` | POST | 删除抓包 |
 | `/dsh-capture/raw-status` | GET | pktmon 过滤规则原文（排障用） |
@@ -180,7 +191,9 @@ reg add "HKLM\SOFTWARE\WOW6432Node\Npcap" /v AdminOnly /t REG_DWORD /d 0 /f
 - **id 不可穿越**：抓包文件 id 是对文件名的 sha256 前缀；解析时二次校验路径必须落在抓包目录内
 - **无 shell 注入**：所有子进程用 `spawn(cmd, argv, { shell: false })`，用户输入永不拼进命令行
 - **未知块安全跳过**：pcapng 解析对未知块 / 截断包只计数不抛异常，半写文件仍可用
-- **内存有界**：分析单次读入 ≤ 96 MB、解析包数 ≤ 120k，超限时明确报错
+- **内存有界**：分析单次读入 ≤ 96 MB、解析包数 ≤ 120k；重组另有双重上限
+  （每方向 `streamCapKb`、总流数 `maxStreams`），超限标记 `truncated` 而不是继续吃内存
+- **重组的诚实性**：检出到 seq 空洞会记进 `gaps`，不会把不连续的数据当成完整消息
 
 ## 开发
 
@@ -188,14 +201,20 @@ reg add "HKLM\SOFTWARE\WOW6432Node\Npcap" /v AdminOnly /t REG_DWORD /d 0 /f
 # 安装到 desktop profile
 node install-dsh-capture.mjs
 
+# 把依赖指向修正到本仓库真身（防止下次 pnpm install 回退到旧副本）
+node repoint-dsh-capture.mjs --check      # 只比较
+node repoint-dsh-capture.mjs              # 备份 + 改依赖 + pnpm install + 校验
+
 # 源码 → 安装副本同步（profile 里是 pnpm 拷的副本，不是符号链接）
 node sync-dsh-capture.mjs
 
 # 验证
-node verify-installed.mjs              # 装机回归 29 项（含后端选择、网卡分类、BPF 转换）
+node verify-installed.mjs              # 装机回归 38 项（含重组/HTTP 事务/TLS/时间戳）
 node verify-icon.cjs                   # 图标与 manifest
-node dsh-capture/test/selftest.mjs     # 解析器基础自测
-node dsh-capture/test/pcapng-idb.test.mjs  # pcapng IDB 回归（真实形状，带 options）
+node recheck-22.mjs                    # 完成度清单复核（22 项）
+node dsh-capture/test/selftest.mjs              # 解析器基础自测
+node dsh-capture/test/pcapng-idb.test.mjs       # pcapng IDB 回归（真实形状，带 options）
+node dsh-capture/test/stream-reassembly.test.mjs # TCP 重组 / HTTP 体 / TLS 详情（7 组）
 ```
 
 ## 文件结构
@@ -209,7 +228,7 @@ dsh-capture/
 ├── lib/
 │   ├── index.js         # 入口：挂路由 + 注册 agent 工具 + Config
 │   ├── routes.js        # 13 条 HTTP 路由
-│   ├── pcap.js          # pcapng/pcap 解析器（零依赖）
+│   ├── pcap.js          # pcapng/pcap 解析器 + TCP 重组 + HTTP/TLS 提取（零依赖）
 │   ├── npcap.js         # Npcap/dumpcap 后端（首选，免提权）
 │   ├── pktmon.js        # pktmon 驱动封装（后备）
 │   ├── perm.js          # 后端选择与环境报告
@@ -218,8 +237,9 @@ dsh-capture/
 │   └── tools.js         # 抓包流程、后端路由、id→路径解析
 ├── client/client.js     # 设置页面板（纯 React + 主题 token）
 └── test/
-    ├── selftest.mjs
-    └── pcapng-idb.test.mjs
+    ├── selftest.mjs               # 解析器基础自测
+    ├── pcapng-idb.test.mjs        # IDB 偏移回归（真实形状，带 options）
+    └── stream-reassembly.test.mjs # TCP 重组 / HTTP 体 / TLS 详情（7 组）
 ```
 
 ## License
