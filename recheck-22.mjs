@@ -1,12 +1,18 @@
 /**
- * 复核 dsh-capture 0.3.0 对原「22 项缺失清单」的实际完成度。
- * 只读：读取仓库内源码，逐项给命中证据行，不做推测。
+ * 复核 dsh-capture 对原「22 项缺失清单」的实际完成度。
+ *
+ * 只读：读取仓库内源码/文件，逐项给命中证据行，不做推测。
+ * 文件存在性检查用 exists()，避免"写了但关键词不匹配"的假阴性。
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const DIR = 'E:/dsh工作区/dsh-capture-repo/dsh-capture';
+// fileURLToPath 而不是手写 pathname 转换：路径含中文时 pathname 是百分号编码的。
+const REPO_ROOT = path.dirname(fileURLToPath(import.meta.url));
+const DIR = process.env.CAPTURE_SRC || path.join(REPO_ROOT, 'dsh-capture');
 const read = (p) => { try { return fs.readFileSync(path.join(DIR, p), 'utf8'); } catch { return ''; } };
+const exists = (p) => fs.existsSync(path.join(DIR, p));
 
 const F = {
   index: read('lib/index.js'),
@@ -50,21 +56,27 @@ const checks = [
   ['13 工具: capture_export', () => /capture_export/.test(F.index), () => hits('导出工具', F.index, /capture_export/, 3)],
   ['14 权限: Npcap AdminOnly 检测', () => /AdminOnly|adminOnly/.test(F.perm), () => hits('AdminOnly', F.perm, /adminOnly/i, 3)],
   ['15 权限: 引导改注册表', () => /reg add|reg\.exe|注册表|registry/i.test(F.perm + F.readme + F.client), () => hits('注册表引导', F.perm + F.readme, /reg add|注册表|AdminOnly=0/i, 3)],
-  ['16 工程: 路由测试', () => /routes|route/i.test(F.index) && /test\//.test(F.pkg), () => hits('路由测试', F.pkg + F.routes, /test|routes/i, 3)],
-  ['17 工程: CI 配置', () => false, () => hits('CI', F.readme, /CI|workflow/i, 3)],
-  ['18 工程: TypeScript 类型', () => /\.ts$|typescript/i.test(F.pkg), () => hits('TS', F.pkg, /typescript|\.ts/i, 2)],
+  ['16 工程: 路由测试', () => exists('test/routes.test.mjs'), () => hits('路由测试文件', F.pkg, /routes\.test|test\//i, 3)],
+  ['17 工程: CI 配置', () => CI_PRESENT(), () => console.log('      （.github/workflows 下无 yml —— CI 文件仍待推送）')],
+  ['18 工程: TypeScript 类型', () => exists('types/index.d.ts') && /"types"/.test(F.pkg), () => hits('TS 声明', F.pkg, /types/i, 2)],
   ['19 工程: Config schema', () => /schemastery|Config\s*=|z\.object/.test(F.index), () => hits('Config', F.index, /schemastery|Config/, 3)],
-  ['20 工程: 日志 ctx.logger', () => /ctx\.logger|logger\./i.test(F.index + F.routes + F.tools), () => hits('日志', F.index + F.routes + F.tools, /logger/i, 3)],
+  ['20 工程: 日志 ctx.logger', () => /ctx\.logger|makeLogger/i.test(F.index), () => hits('日志', F.index, /logger/i, 3)],
   ['21 工程: i18n 双语', () => /locale\/en\.json|en\.json/.test(F.pkg), () => hits('i18n', F.pkg, /locale/i, 3)],
-  ['22 边界: 大文件流式解析', () => /createReadStream|streamAnalyze/i.test(F.pcap), () => hits('流式解析', F.pcap, /createReadStream|readFileSync/, 3)],
+  ['22 边界: 大文件流式解析', () => /parseCaptureStream/.test(F.pcap) && /ChunkReader/.test(F.pcap),
+    () => hits('流式解析', F.pcap, /ChunkReader|readFileSync/, 3)],
 ];
 
-const dir = process.argv[2];
-if (dir) process.chdir(dir);
+/** CI 工作流是否已真正落在 .github/workflows 下（而非 .pending 待推）。 */
+function CI_PRESENT() {
+  const wfDir = path.join(path.dirname(DIR), '.github', 'workflows');
+  try {
+    return fs.readdirSync(wfDir).some((f) => /\.ya?ml$/i.test(f));
+  } catch { return false; }
+}
 
 let done = 0, open = 0;
 const still = [];
-console.log('=== dsh-capture 0.3.0 对原 22 项缺失清单的复核 ===\n');
+console.log('=== dsh-capture 对原 22 项缺失清单的复核 ===\n');
 for (const [name, has, ev] of checks) {
   const ok = has();
   if (ok) done++; else { open++; still.push(name); }
